@@ -36,6 +36,15 @@ input double      MaxSpreadPips        = 5.0;        // Max Spread (pips)
 input int         ATR_Period           = 14;          // ATR Period
 input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
 
+// --- Breakeven ---
+input bool        EnableBreakeven      = true;        // Enable Breakeven
+input double      BreakevenPips        = 56.0;        // Pips in profit to move SL to breakeven
+
+// --- Trailing Stop ---
+input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
+input double      TrailTriggerPips     = 80.0;        // Pips in profit to activate trailing
+input double      TrailDistancePips    = 70.0;        // Distance to trail behind price (pips)
+
 // --- Lot Sizing ---
 input ENUM_LOT_MODE LotMode            = LOT_MODE_FIXED; // Lot Sizing Mode
 input double      FixedLots            = 0.1;        // Fixed Lot Size
@@ -57,6 +66,8 @@ double   g_lastBuyValue6;     // last Value6 used for buy order
 
 bool     g_sellWaitingSignal; // waiting for new Value5 after SL/close
 bool     g_buyWaitingSignal;  // waiting for new Value6 after SL/close
+
+bool     g_breakevenApplied; // breakeven already moved for current position
 
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
@@ -597,6 +608,8 @@ void PlaceInitialOrders()
 //+------------------------------------------------------------------+
 void MonitorM30Candle()
 {
+   bool hasOpenPosition = (CountOpenPositions() > 0);
+
    // Check Value 5 on shift 1 (just-closed M30 candle)
    double newValue5 = GetIndicatorValue(BUF_VALUE5, 1);
 
@@ -608,21 +621,17 @@ void MonitorM30Candle()
          Log(StringFormat("NEW Value5 detected: %.5f (prev: %.5f)", newValue5, g_lastSellValue5));
          g_lastSellValue5 = newValue5;
 
-         if(g_sellWaitingSignal)
+         // If a position is open, pause all updates to the sell stop
+         if(hasOpenPosition)
+         {
+            Log("Position is open - pausing Sell Stop updates");
+         }
+         else if(g_sellWaitingSignal)
          {
             // Was waiting for a new signal after SL/close - place new order
             Log("Sell side was waiting for signal - placing new Sell Stop");
             g_sellWaitingSignal = false;
-
-            // Check if there's already an open position
-            if(CountOpenPositions() == 0)
-            {
-               g_sellTicket = PlaceSellStop(newValue5);
-            }
-            else
-            {
-               Log("Open position exists - deferring Sell Stop placement");
-            }
+            g_sellTicket = PlaceSellStop(newValue5);
          }
          else if(PendingOrderExists(g_sellTicket))
          {
@@ -630,7 +639,7 @@ void MonitorM30Candle()
             Log("Updating Sell Stop to new Value5");
             ModifySellStop(g_sellTicket, newValue5);
          }
-         else if(!OrderTriggered(g_sellTicket) && CountOpenPositions() == 0)
+         else if(!OrderTriggered(g_sellTicket))
          {
             // No pending and no open - place fresh
             g_sellTicket = PlaceSellStop(newValue5);
@@ -649,20 +658,17 @@ void MonitorM30Candle()
          Log(StringFormat("NEW Value6 detected: %.5f (prev: %.5f)", newValue6, g_lastBuyValue6));
          g_lastBuyValue6 = newValue6;
 
-         if(g_buyWaitingSignal)
+         // If a position is open, pause all updates to the buy stop
+         if(hasOpenPosition)
+         {
+            Log("Position is open - pausing Buy Stop updates");
+         }
+         else if(g_buyWaitingSignal)
          {
             // Was waiting for a new signal after SL/close - place new order
             Log("Buy side was waiting for signal - placing new Buy Stop");
             g_buyWaitingSignal = false;
-
-            if(CountOpenPositions() == 0)
-            {
-               g_buyTicket = PlaceBuyStop(newValue6);
-            }
-            else
-            {
-               Log("Open position exists - deferring Buy Stop placement");
-            }
+            g_buyTicket = PlaceBuyStop(newValue6);
          }
          else if(PendingOrderExists(g_buyTicket))
          {
@@ -670,7 +676,7 @@ void MonitorM30Candle()
             Log("Updating Buy Stop to new Value6");
             ModifyBuyStop(g_buyTicket, newValue6);
          }
-         else if(!OrderTriggered(g_buyTicket) && CountOpenPositions() == 0)
+         else if(!OrderTriggered(g_buyTicket))
          {
             // No pending and no open - place fresh
             g_buyTicket = PlaceBuyStop(newValue6);
@@ -700,6 +706,7 @@ void MonitorOrderStates()
             Log(StringFormat("Sell order #%d was CLOSED (SL hit or manual close)", g_sellTicket));
             g_sellTicket = -1;
             g_sellWaitingSignal = true;
+            g_breakevenApplied = false;
             Log("Sell side now WAITING for new Value5 signal before re-entry");
          }
       }
@@ -719,7 +726,99 @@ void MonitorOrderStates()
             Log(StringFormat("Buy order #%d was CLOSED (SL hit or manual close)", g_buyTicket));
             g_buyTicket = -1;
             g_buyWaitingSignal = true;
+            g_breakevenApplied = false;
             Log("Buy side now WAITING for new Value6 signal before re-entry");
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Manage breakeven and trailing stop for open positions             |
+//+------------------------------------------------------------------+
+void ManageOpenPositions()
+{
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber)
+         continue;
+
+      int type = OrderType();
+      if(type != OP_BUY && type != OP_SELL)
+         continue;
+
+      double openPrice = OrderOpenPrice();
+      double currentSL = OrderStopLoss();
+      double newSL     = currentSL;
+
+      if(type == OP_BUY)
+      {
+         double profitPips = (Bid - openPrice) / g_pipSize;
+
+         // Breakeven
+         if(EnableBreakeven && !g_breakevenApplied && profitPips >= BreakevenPips)
+         {
+            double beSL = NormalizeDouble(openPrice, Digits);
+            if(beSL > currentSL || currentSL == 0)
+            {
+               newSL = beSL;
+               g_breakevenApplied = true;
+               Log(StringFormat("BREAKEVEN BUY #%d: Moving SL to entry %.5f (profit=%.1f pips)",
+                   OrderTicket(), beSL, profitPips));
+            }
+         }
+
+         // Trailing stop
+         if(EnableTrailingStop && profitPips >= TrailTriggerPips)
+         {
+            double trailSL = NormalizeDouble(Bid - TrailDistancePips * g_pipSize, Digits);
+            if(trailSL > newSL || newSL == 0)
+            {
+               Log(StringFormat("TRAILING BUY #%d: Moving SL to %.5f (profit=%.1f pips, trail=%.1f pips)",
+                   OrderTicket(), trailSL, profitPips, TrailDistancePips));
+               newSL = trailSL;
+            }
+         }
+      }
+      else // OP_SELL
+      {
+         double profitPips = (openPrice - Ask) / g_pipSize;
+
+         // Breakeven
+         if(EnableBreakeven && !g_breakevenApplied && profitPips >= BreakevenPips)
+         {
+            double beSL = NormalizeDouble(openPrice, Digits);
+            if(beSL < currentSL || currentSL == 0)
+            {
+               newSL = beSL;
+               g_breakevenApplied = true;
+               Log(StringFormat("BREAKEVEN SELL #%d: Moving SL to entry %.5f (profit=%.1f pips)",
+                   OrderTicket(), beSL, profitPips));
+            }
+         }
+
+         // Trailing stop
+         if(EnableTrailingStop && profitPips >= TrailTriggerPips)
+         {
+            double trailSL = NormalizeDouble(Ask + TrailDistancePips * g_pipSize, Digits);
+            if(trailSL < newSL || newSL == 0)
+            {
+               Log(StringFormat("TRAILING SELL #%d: Moving SL to %.5f (profit=%.1f pips, trail=%.1f pips)",
+                   OrderTicket(), trailSL, profitPips, TrailDistancePips));
+               newSL = trailSL;
+            }
+         }
+      }
+
+      // Apply SL modification if changed
+      if(MathAbs(newSL - currentSL) > Point && newSL != 0)
+      {
+         if(!OrderModify(OrderTicket(), openPrice, newSL, OrderTakeProfit(), 0, clrYellow))
+         {
+            Log(StringFormat("FAILED to modify SL for #%d: newSL=%.5f, error=%d",
+                OrderTicket(), newSL, GetLastError()));
          }
       }
    }
@@ -736,6 +835,9 @@ int OnInit()
        PipsToRisk, MaxSpreadPips, ATR_Period, ATR_MinValue));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
+   Log(StringFormat("Breakeven: %s, Pips=%.1f", (EnableBreakeven ? "ON" : "OFF"), BreakevenPips));
+   Log(StringFormat("Trailing Stop: %s, Trigger=%.1f pips, Distance=%.1f pips",
+       (EnableTrailingStop ? "ON" : "OFF"), TrailTriggerPips, TrailDistancePips));
    Log(StringFormat("Magic: %d, Comment: %s", MagicNumber, OrderComment));
 
    // Calculate pip size
@@ -752,6 +854,7 @@ int OnInit()
    g_lastBuyValue6     = 0;
    g_sellWaitingSignal = false;
    g_buyWaitingSignal  = false;
+   g_breakevenApplied  = false;
    g_lastM30Bar        = iTime(Symbol(), PERIOD_M30, 0);
 
    // Check for any existing orders from previous runs
@@ -800,6 +903,9 @@ void OnTick()
 {
    // Monitor order states every tick (check for SL hits, closures)
    MonitorOrderStates();
+
+   // Manage breakeven and trailing stop for open positions
+   ManageOpenPositions();
 
    // Check for new M30 candle close
    datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);

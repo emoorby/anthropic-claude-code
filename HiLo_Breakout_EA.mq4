@@ -33,9 +33,9 @@ input double      PipsToRisk           = 56.0;       // Pips to Risk (total)
 input double      MaxSpreadPips        = 5.0;        // Max Spread (pips)
 
 // --- ATR ---
-input int         ATR_Period           = 14;          // ATR Period
+input int         ATR_Period           = 30;          // ATR Period
 input bool        EnableATRFilter      = true;        // Enable ATR Filter
-input double      ATR_MinValue         = 30.0;        // ATR Minimum Value (pips)
+input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
 
 // --- Profit Target ---
 input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR)

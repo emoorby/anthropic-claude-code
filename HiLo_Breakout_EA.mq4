@@ -434,6 +434,9 @@ int PlaceSellStop(double value5)
    double atrPrice = GetATRPrice();
    double tpPrice  = NormalizeDouble(entryPrice - atrPrice * ProfitTargetFactor, Digits);
 
+   Log(StringFormat("SELL TP calc: ATR_Period=%d, ATR_price=%.5f, Factor=%.2f, TP=%.5f",
+       ATR_Period, atrPrice, ProfitTargetFactor, tpPrice));
+
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
    if(Bid - entryPrice < stopLevel)
@@ -477,6 +480,9 @@ int PlaceBuyStop(double value6)
    // Calculate TP from ATR
    double atrPrice = GetATRPrice();
    double tpPrice  = NormalizeDouble(entryPrice + atrPrice * ProfitTargetFactor, Digits);
+
+   Log(StringFormat("BUY TP calc: ATR_Period=%d, ATR_price=%.5f, Factor=%.2f, TP=%.5f",
+       ATR_Period, atrPrice, ProfitTargetFactor, tpPrice));
 
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;

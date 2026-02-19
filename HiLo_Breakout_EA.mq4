@@ -210,20 +210,20 @@ double GetSpreadPips()
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Get ATR value on M30 in pips                              |
+//| Helper: Get ATR value in pips (chart timeframe)                   |
 //+------------------------------------------------------------------+
 double GetATRPips()
 {
-   double atrValue = iATR(Symbol(), PERIOD_M30, ATR_Period, 1);
+   double atrValue = iATR(Symbol(), Period(), ATR_Period, 1);
    return atrValue / g_pipSize;
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Get ATR value on M30 in price terms                       |
+//| Helper: Get ATR value in price terms (chart timeframe)            |
 //+------------------------------------------------------------------+
 double GetATRPrice()
 {
-   return iATR(Symbol(), PERIOD_M30, ATR_Period, 1);
+   return iATR(Symbol(), Period(), ATR_Period, 1);
 }
 
 //+------------------------------------------------------------------+

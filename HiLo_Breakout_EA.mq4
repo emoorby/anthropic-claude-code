@@ -32,17 +32,21 @@ input string      IndicatorName        = "!!!3 level zz semafor mtf alerts nmc-p
 input double      PipsToRisk           = 56.0;       // Pips to Risk (total)
 input double      MaxSpreadPips        = 5.0;        // Max Spread (pips)
 
-// --- ATR Filter ---
+// --- ATR ---
 input int         ATR_Period           = 14;          // ATR Period
-input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
+input bool        EnableATRFilter      = true;        // Enable ATR Filter
+input double      ATR_MinValue         = 30.0;        // ATR Minimum Value (pips)
+
+// --- Profit Target ---
+input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR)
 
 // --- Breakeven ---
 input bool        EnableBreakeven      = true;        // Enable Breakeven
-input double      BreakevenPips        = 56.0;        // Pips in profit to move SL to breakeven
+input double      BreakevenTriggerFactor = 0.75;      // Breakeven Trigger Factor (x ATR)
 
 // --- Trailing Stop ---
 input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
-input double      TrailTriggerPips     = 80.0;        // Pips in profit to activate trailing
+input double      TrailTriggerFactor   = 1.7;         // Trailing Trigger Factor (x ATR)
 input double      TrailDistancePips    = 70.0;        // Distance to trail behind price (pips)
 
 // --- Lot Sizing ---
@@ -206,12 +210,20 @@ double GetSpreadPips()
 }
 
 //+------------------------------------------------------------------+
-//| Helper: Get ATR value on M30                                      |
+//| Helper: Get ATR value on M30 in pips                              |
 //+------------------------------------------------------------------+
 double GetATRPips()
 {
    double atrValue = iATR(Symbol(), PERIOD_M30, ATR_Period, 1);
    return atrValue / g_pipSize;
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Get ATR value on M30 in price terms                       |
+//+------------------------------------------------------------------+
+double GetATRPrice()
+{
+   return iATR(Symbol(), PERIOD_M30, ATR_Period, 1);
 }
 
 //+------------------------------------------------------------------+
@@ -233,6 +245,9 @@ bool CheckSpreadFilter()
 //+------------------------------------------------------------------+
 bool CheckATRFilter()
 {
+   if(!EnableATRFilter)
+      return true;
+
    double atrPips = GetATRPips();
    if(atrPips < ATR_MinValue)
    {
@@ -415,6 +430,10 @@ int PlaceSellStop(double value5)
    double slPrice    = NormalizeDouble(value5 + g_halfRisk, Digits);
    double lots       = CalculateLotSize(PipsToRisk);
 
+   // Calculate TP from ATR
+   double atrPrice = GetATRPrice();
+   double tpPrice  = NormalizeDouble(entryPrice - atrPrice * ProfitTargetFactor, Digits);
+
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
    if(Bid - entryPrice < stopLevel)
@@ -424,18 +443,18 @@ int PlaceSellStop(double value5)
       return -1;
    }
 
-   int ticket = OrderSend(Symbol(), OP_SELLSTOP, lots, entryPrice, 3, slPrice, 0,
+   int ticket = OrderSend(Symbol(), OP_SELLSTOP, lots, entryPrice, 3, slPrice, tpPrice,
                            OrderComment, MagicNumber, 0, clrRed);
 
    if(ticket > 0)
    {
-      Log(StringFormat("SELL STOP placed #%d: Entry=%.5f, SL=%.5f, Lots=%.2f, Value5=%.5f",
-          ticket, entryPrice, slPrice, lots, value5));
+      Log(StringFormat("SELL STOP placed #%d: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, Value5=%.5f",
+          ticket, entryPrice, slPrice, tpPrice, lots, value5));
    }
    else
    {
-      Log(StringFormat("FAILED to place Sell Stop: Entry=%.5f, SL=%.5f, Error=%d",
-          entryPrice, slPrice, GetLastError()));
+      Log(StringFormat("FAILED to place Sell Stop: Entry=%.5f, SL=%.5f, TP=%.5f, Error=%d",
+          entryPrice, slPrice, tpPrice, GetLastError()));
    }
 
    return ticket;
@@ -455,6 +474,10 @@ int PlaceBuyStop(double value6)
    double slPrice    = NormalizeDouble(value6 - g_halfRisk, Digits);
    double lots       = CalculateLotSize(PipsToRisk);
 
+   // Calculate TP from ATR
+   double atrPrice = GetATRPrice();
+   double tpPrice  = NormalizeDouble(entryPrice + atrPrice * ProfitTargetFactor, Digits);
+
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
    if(entryPrice - Ask < stopLevel)
@@ -464,18 +487,18 @@ int PlaceBuyStop(double value6)
       return -1;
    }
 
-   int ticket = OrderSend(Symbol(), OP_BUYSTOP, lots, entryPrice, 3, slPrice, 0,
+   int ticket = OrderSend(Symbol(), OP_BUYSTOP, lots, entryPrice, 3, slPrice, tpPrice,
                            OrderComment, MagicNumber, 0, clrBlue);
 
    if(ticket > 0)
    {
-      Log(StringFormat("BUY STOP placed #%d: Entry=%.5f, SL=%.5f, Lots=%.2f, Value6=%.5f",
-          ticket, entryPrice, slPrice, lots, value6));
+      Log(StringFormat("BUY STOP placed #%d: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, Value6=%.5f",
+          ticket, entryPrice, slPrice, tpPrice, lots, value6));
    }
    else
    {
-      Log(StringFormat("FAILED to place Buy Stop: Entry=%.5f, SL=%.5f, Error=%d",
-          entryPrice, slPrice, GetLastError()));
+      Log(StringFormat("FAILED to place Buy Stop: Entry=%.5f, SL=%.5f, TP=%.5f, Error=%d",
+          entryPrice, slPrice, tpPrice, GetLastError()));
    }
 
    return ticket;
@@ -738,6 +761,10 @@ void MonitorOrderStates()
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
+   double atrPips = GetATRPips();
+   double breakevenThreshold = atrPips * BreakevenTriggerFactor;
+   double trailTriggerThreshold = atrPips * TrailTriggerFactor;
+
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
@@ -757,27 +784,27 @@ void ManageOpenPositions()
       {
          double profitPips = (Bid - openPrice) / g_pipSize;
 
-         // Breakeven
-         if(EnableBreakeven && !g_breakevenApplied && profitPips >= BreakevenPips)
+         // Breakeven (triggered at ATR * BreakevenTriggerFactor)
+         if(EnableBreakeven && !g_breakevenApplied && profitPips >= breakevenThreshold)
          {
             double beSL = NormalizeDouble(openPrice, Digits);
             if(beSL > currentSL || currentSL == 0)
             {
                newSL = beSL;
                g_breakevenApplied = true;
-               Log(StringFormat("BREAKEVEN BUY #%d: Moving SL to entry %.5f (profit=%.1f pips)",
-                   OrderTicket(), beSL, profitPips));
+               Log(StringFormat("BREAKEVEN BUY #%d: Moving SL to entry %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f])",
+                   OrderTicket(), beSL, profitPips, breakevenThreshold, BreakevenTriggerFactor));
             }
          }
 
-         // Trailing stop
-         if(EnableTrailingStop && profitPips >= TrailTriggerPips)
+         // Trailing stop (triggered at ATR * TrailTriggerFactor)
+         if(EnableTrailingStop && profitPips >= trailTriggerThreshold)
          {
             double trailSL = NormalizeDouble(Bid - TrailDistancePips * g_pipSize, Digits);
             if(trailSL > newSL || newSL == 0)
             {
-               Log(StringFormat("TRAILING BUY #%d: Moving SL to %.5f (profit=%.1f pips, trail=%.1f pips)",
-                   OrderTicket(), trailSL, profitPips, TrailDistancePips));
+               Log(StringFormat("TRAILING BUY #%d: Moving SL to %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f], trail=%.1f pips)",
+                   OrderTicket(), trailSL, profitPips, trailTriggerThreshold, TrailTriggerFactor, TrailDistancePips));
                newSL = trailSL;
             }
          }
@@ -786,27 +813,27 @@ void ManageOpenPositions()
       {
          double profitPips = (openPrice - Ask) / g_pipSize;
 
-         // Breakeven
-         if(EnableBreakeven && !g_breakevenApplied && profitPips >= BreakevenPips)
+         // Breakeven (triggered at ATR * BreakevenTriggerFactor)
+         if(EnableBreakeven && !g_breakevenApplied && profitPips >= breakevenThreshold)
          {
             double beSL = NormalizeDouble(openPrice, Digits);
             if(beSL < currentSL || currentSL == 0)
             {
                newSL = beSL;
                g_breakevenApplied = true;
-               Log(StringFormat("BREAKEVEN SELL #%d: Moving SL to entry %.5f (profit=%.1f pips)",
-                   OrderTicket(), beSL, profitPips));
+               Log(StringFormat("BREAKEVEN SELL #%d: Moving SL to entry %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f])",
+                   OrderTicket(), beSL, profitPips, breakevenThreshold, BreakevenTriggerFactor));
             }
          }
 
-         // Trailing stop
-         if(EnableTrailingStop && profitPips >= TrailTriggerPips)
+         // Trailing stop (triggered at ATR * TrailTriggerFactor)
+         if(EnableTrailingStop && profitPips >= trailTriggerThreshold)
          {
             double trailSL = NormalizeDouble(Ask + TrailDistancePips * g_pipSize, Digits);
             if(trailSL < newSL || newSL == 0)
             {
-               Log(StringFormat("TRAILING SELL #%d: Moving SL to %.5f (profit=%.1f pips, trail=%.1f pips)",
-                   OrderTicket(), trailSL, profitPips, TrailDistancePips));
+               Log(StringFormat("TRAILING SELL #%d: Moving SL to %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f], trail=%.1f pips)",
+                   OrderTicket(), trailSL, profitPips, trailTriggerThreshold, TrailTriggerFactor, TrailDistancePips));
                newSL = trailSL;
             }
          }
@@ -831,13 +858,15 @@ int OnInit()
 {
    Log("=== HiLo Breakout EA Starting ===");
    Log(StringFormat("Symbol: %s, Digits: %d, Point: %s", Symbol(), Digits, DoubleToStr(Point, Digits)));
-   Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d, ATR_Min=%.1f",
-       PipsToRisk, MaxSpreadPips, ATR_Period, ATR_MinValue));
+   Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d",
+       PipsToRisk, MaxSpreadPips, ATR_Period));
+   Log(StringFormat("ATR Filter: %s, Min=%.1f pips", (EnableATRFilter ? "ON" : "OFF"), ATR_MinValue));
+   Log(StringFormat("Profit Target Factor: %.2f (x ATR)", ProfitTargetFactor));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
-   Log(StringFormat("Breakeven: %s, Pips=%.1f", (EnableBreakeven ? "ON" : "OFF"), BreakevenPips));
-   Log(StringFormat("Trailing Stop: %s, Trigger=%.1f pips, Distance=%.1f pips",
-       (EnableTrailingStop ? "ON" : "OFF"), TrailTriggerPips, TrailDistancePips));
+   Log(StringFormat("Breakeven: %s, Trigger Factor=%.2f (x ATR)", (EnableBreakeven ? "ON" : "OFF"), BreakevenTriggerFactor));
+   Log(StringFormat("Trailing Stop: %s, Trigger Factor=%.2f (x ATR), Distance=%.1f pips",
+       (EnableTrailingStop ? "ON" : "OFF"), TrailTriggerFactor, TrailDistancePips));
    Log(StringFormat("Magic: %d, Comment: %s", MagicNumber, OrderComment));
 
    // Calculate pip size

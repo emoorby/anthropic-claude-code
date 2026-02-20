@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "HiLo Breakout EA"
 #property link      ""
-#property version   "1.00"
+#property version   "1.10"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -981,6 +981,27 @@ void OnTick()
 
    // Manage breakeven and trailing stop for open positions
    ManageOpenPositions();
+
+   // ER filter: delete pending orders if ER drops below threshold
+   if(EnableERFilter)
+   {
+      double erValue = GetERValue();
+      if(erValue < ER_MinValue)
+      {
+         if(g_sellTicket > 0 && PendingOrderExists(g_sellTicket))
+         {
+            Log(StringFormat("ER dropped to %.4f (min=%.4f) - deleting sell stop #%d", erValue, ER_MinValue, g_sellTicket));
+            if(DeletePendingOrder(g_sellTicket))
+               g_sellTicket = 0;
+         }
+         if(g_buyTicket > 0 && PendingOrderExists(g_buyTicket))
+         {
+            Log(StringFormat("ER dropped to %.4f (min=%.4f) - deleting buy stop #%d", erValue, ER_MinValue, g_buyTicket));
+            if(DeletePendingOrder(g_buyTicket))
+               g_buyTicket = 0;
+         }
+      }
+   }
 
    // Check for new M30 candle close
    datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);

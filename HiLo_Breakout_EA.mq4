@@ -37,6 +37,12 @@ input int         ATR_Period           = 30;          // ATR Period
 input bool        EnableATRFilter      = true;        // Enable ATR Filter
 input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
 
+// --- Efficiency Ratio ---
+input bool        EnableERFilter       = true;        // Enable ER Filter
+input string      ER_IndicatorName     = "SqEfficiencyRatio"; // ER Indicator Name
+input int         ER_Period            = 48;          // ER Period
+input double      ER_MinValue          = 0.30;        // ER Minimum Value
+
 // --- Profit Target ---
 input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR)
 
@@ -258,6 +264,31 @@ bool CheckATRFilter()
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Get Efficiency Ratio value (chart timeframe)              |
+//+------------------------------------------------------------------+
+double GetERValue()
+{
+   return iCustom(Symbol(), Period(), ER_IndicatorName, ER_Period, 0, 1);
+}
+
+//+------------------------------------------------------------------+
+//| Helper: Check if Efficiency Ratio filter passes                   |
+//+------------------------------------------------------------------+
+bool CheckERFilter()
+{
+   if(!EnableERFilter)
+      return true;
+
+   double erValue = GetERValue();
+   if(erValue < ER_MinValue)
+   {
+      Log(StringFormat("ER filter FAILED: ER=%.4f < Min=%.4f", erValue, ER_MinValue));
+      return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
 //| Helper: Count open positions with our magic number                |
 //+------------------------------------------------------------------+
 int CountOpenPositions()
@@ -425,6 +456,8 @@ int PlaceSellStop(double value5)
       return -1;
    if(!CheckATRFilter())
       return -1;
+   if(!CheckERFilter())
+      return -1;
 
    double entryPrice = NormalizeDouble(value5 - g_halfRisk, Digits);
    double slPrice    = NormalizeDouble(value5 + g_halfRisk, Digits);
@@ -471,6 +504,8 @@ int PlaceBuyStop(double value6)
    if(!CheckSpreadFilter())
       return -1;
    if(!CheckATRFilter())
+      return -1;
+   if(!CheckERFilter())
       return -1;
 
    double entryPrice = NormalizeDouble(value6 + g_halfRisk, Digits);
@@ -522,6 +557,8 @@ bool ModifySellStop(int ticket, double value5)
       return false;
    if(!CheckATRFilter())
       return false;
+   if(!CheckERFilter())
+      return false;
 
    double entryPrice = NormalizeDouble(value5 - g_halfRisk, Digits);
    double slPrice    = NormalizeDouble(value5 + g_halfRisk, Digits);
@@ -560,6 +597,8 @@ bool ModifyBuyStop(int ticket, double value6)
    if(!CheckSpreadFilter())
       return false;
    if(!CheckATRFilter())
+      return false;
+   if(!CheckERFilter())
       return false;
 
    double entryPrice = NormalizeDouble(value6 + g_halfRisk, Digits);
@@ -867,6 +906,7 @@ int OnInit()
    Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d",
        PipsToRisk, MaxSpreadPips, ATR_Period));
    Log(StringFormat("ATR Filter: %s, Min=%.1f pips", (EnableATRFilter ? "ON" : "OFF"), ATR_MinValue));
+   Log(StringFormat("ER Filter: %s, Period=%d, Min=%.2f, Indicator=%s", (EnableERFilter ? "ON" : "OFF"), ER_Period, ER_MinValue, ER_IndicatorName));
    Log(StringFormat("Profit Target Factor: %.2f (x ATR)", ProfitTargetFactor));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));

@@ -38,10 +38,14 @@ input bool        EnableATRFilter      = true;        // Enable ATR Filter
 input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
 
 // --- Efficiency Ratio ---
-input bool        EnableERFilter       = true;        // Enable ER Filter
 input string      ER_IndicatorName     = "SqEfficiencyRatio"; // ER Indicator Name
 input int         ER_Period            = 48;          // ER Period
-input double      ER_MinValue          = 0.30;        // ER Minimum Value
+// Layer 1: Block new order placement when ER is low
+input bool        EnableER_Layer1      = true;        // Enable ER Layer 1 (block new orders)
+input double      ER_Layer1_MinValue   = 0.30;        // ER Layer 1 Minimum Value
+// Layer 2: Delete existing pending orders if ER drops
+input bool        EnableER_Layer2      = true;        // Enable ER Layer 2 (delete pending orders)
+input double      ER_Layer2_MinValue   = 0.30;        // ER Layer 2 Minimum Value
 
 // --- Profit Target ---
 input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR)
@@ -276,13 +280,13 @@ double GetERValue()
 //+------------------------------------------------------------------+
 bool CheckERFilter()
 {
-   if(!EnableERFilter)
+   if(!EnableER_Layer1)
       return true;
 
    double erValue = GetERValue();
-   if(erValue < ER_MinValue)
+   if(erValue < ER_Layer1_MinValue)
    {
-      Log(StringFormat("ER filter FAILED: ER=%.4f < Min=%.4f", erValue, ER_MinValue));
+      Log(StringFormat("ER Layer 1 BLOCKED: ER=%.4f < Min=%.4f", erValue, ER_Layer1_MinValue));
       return false;
    }
    return true;
@@ -906,7 +910,10 @@ int OnInit()
    Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d",
        PipsToRisk, MaxSpreadPips, ATR_Period));
    Log(StringFormat("ATR Filter: %s, Min=%.1f pips", (EnableATRFilter ? "ON" : "OFF"), ATR_MinValue));
-   Log(StringFormat("ER Filter: %s, Period=%d, Min=%.2f, Indicator=%s", (EnableERFilter ? "ON" : "OFF"), ER_Period, ER_MinValue, ER_IndicatorName));
+   Log(StringFormat("ER Layer 1 (block orders): %s, Min=%.2f | Layer 2 (delete pending): %s, Min=%.2f | Period=%d, Indicator=%s",
+       (EnableER_Layer1 ? "ON" : "OFF"), ER_Layer1_MinValue,
+       (EnableER_Layer2 ? "ON" : "OFF"), ER_Layer2_MinValue,
+       ER_Period, ER_IndicatorName));
    Log(StringFormat("Profit Target Factor: %.2f (x ATR)", ProfitTargetFactor));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
@@ -982,21 +989,21 @@ void OnTick()
    // Manage breakeven and trailing stop for open positions
    ManageOpenPositions();
 
-   // ER filter: delete pending orders if ER drops below threshold
-   if(EnableERFilter)
+   // ER Layer 2: delete pending orders if ER drops below threshold
+   if(EnableER_Layer2)
    {
       double erValue = GetERValue();
-      if(erValue < ER_MinValue)
+      if(erValue < ER_Layer2_MinValue)
       {
          if(g_sellTicket > 0 && PendingOrderExists(g_sellTicket))
          {
-            Log(StringFormat("ER dropped to %.4f (min=%.4f) - deleting sell stop #%d", erValue, ER_MinValue, g_sellTicket));
+            Log(StringFormat("ER Layer 2: ER=%.4f < Min=%.4f - deleting sell stop #%d", erValue, ER_Layer2_MinValue, g_sellTicket));
             if(DeletePendingOrder(g_sellTicket))
                g_sellTicket = 0;
          }
          if(g_buyTicket > 0 && PendingOrderExists(g_buyTicket))
          {
-            Log(StringFormat("ER dropped to %.4f (min=%.4f) - deleting buy stop #%d", erValue, ER_MinValue, g_buyTicket));
+            Log(StringFormat("ER Layer 2: ER=%.4f < Min=%.4f - deleting buy stop #%d", erValue, ER_Layer2_MinValue, g_buyTicket));
             if(DeletePendingOrder(g_buyTicket))
                g_buyTicket = 0;
          }

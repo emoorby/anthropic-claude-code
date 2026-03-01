@@ -1,5 +1,11 @@
 # CLAUDE.md — AI Assistant Guide for HiLo_Breakout_EA
 
+## Claude Model
+
+```
+claude --model claude-opus-4-5-20251101
+```
+
 ## Project Overview
 
 This repository contains a single **MQL4 Expert Advisor (EA)** for MetaTrader 4: an automated Forex/gold trading robot implementing a breakout strategy using the "3 Level ZZ Semafor" indicator.

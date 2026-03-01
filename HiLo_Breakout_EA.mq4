@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "HiLo Breakout EA"
 #property link      ""
-#property version   "1.10"
+#property version   "2.00"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -37,6 +37,9 @@ input int         ATR_Period           = 30;          // ATR Period
 input bool        EnableATRFilter      = true;        // Enable ATR Filter
 input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
 
+// --- KAMA Settings ---
+input int         KAMA_FastPeriod      = 3;           // KAMA Fast Smoothing Period
+
 // --- Efficiency Ratio ---
 input string      ER_IndicatorName     = "SqEfficiencyRatio"; // ER Indicator Name
 input int         ER_Period            = 48;          // ER Period
@@ -48,16 +51,16 @@ input bool        EnableER_Layer2      = true;        // Enable ER Layer 2 (dele
 input double      ER_Layer2_MinValue   = 0.30;        // ER Layer 2 Minimum Value
 
 // --- Profit Target ---
-input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR)
+input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR, KAMA-adaptive)
 
 // --- Breakeven ---
 input bool        EnableBreakeven      = true;        // Enable Breakeven
 input double      BreakevenTriggerFactor = 0.75;      // Breakeven Trigger Factor (x ATR)
 
-// --- Trailing Stop ---
+// --- Trailing Stop (V2.0: adaptive distance, fixed activation) ---
 input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
-input double      TrailTriggerFactor   = 1.7;         // Trailing Trigger Factor (x ATR)
-input double      TrailDistancePips    = 70.0;        // Distance to trail behind price (pips)
+input double      TrailActivationPips  = 70.0;        // Trailing Activation Threshold (pips profit)
+input double      TrailSCCoef          = 1.7;         // Trail Distance Coefficient (x SC x ATR)
 
 // --- Lot Sizing ---
 input ENUM_LOT_MODE LotMode            = LOT_MODE_FIXED; // Lot Sizing Mode
@@ -67,21 +70,25 @@ input double      RiskPercent          = 1.0;        // Risk Percent of Balance
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
 //+------------------------------------------------------------------+
-double   g_pipSize;           // pip size in price terms
-int      g_pipDigits;         // number of decimal places for pips
-double   g_halfRisk;          // PipsToRisk / 2 in price terms
+double   g_pipSize;             // pip size in price terms
+int      g_pipDigits;           // number of decimal places for pips
+double   g_halfRisk;            // PipsToRisk / 2 in price terms
 
-datetime g_lastM30Bar;        // track M30 bar close
-int      g_sellTicket;        // current sell stop ticket
-int      g_buyTicket;         // current buy stop ticket
+datetime g_lastM30Bar;          // track M30 bar close for signal detection
+datetime g_lastChartBar;        // track chart-timeframe bar for trail distance recalculation
 
-double   g_lastSellValue5;    // last Value5 used for sell order
-double   g_lastBuyValue6;     // last Value6 used for buy order
+int      g_sellTicket;          // current sell stop ticket
+int      g_buyTicket;           // current buy stop ticket
 
-bool     g_sellWaitingSignal; // waiting for new Value5 after SL/close
-bool     g_buyWaitingSignal;  // waiting for new Value6 after SL/close
+double   g_lastSellValue5;      // last Value5 used for sell order
+double   g_lastBuyValue6;       // last Value6 used for buy order
 
-bool     g_breakevenApplied; // breakeven already moved for current position
+bool     g_sellWaitingSignal;   // waiting for new Value5 after SL/close
+bool     g_buyWaitingSignal;    // waiting for new Value6 after SL/close
+
+bool     g_breakevenApplied;    // breakeven already moved for current position
+
+double   g_trailDistancePrice;  // adaptive trail distance in price terms (updated per chart bar)
 
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
@@ -237,6 +244,50 @@ double GetATRPrice()
 }
 
 //+------------------------------------------------------------------+
+//| Helper: Get Efficiency Ratio value (chart timeframe, shift 1)     |
+//+------------------------------------------------------------------+
+double GetERValue()
+{
+   return iCustom(Symbol(), Period(), ER_IndicatorName, ER_Period, 0, 1);
+}
+
+//+------------------------------------------------------------------+
+//| KAMA: Calculate smoothing constant SC = SC_raw^2                  |
+//|   fast_SC = 2 / (KAMA_FastPeriod + 1)                            |
+//|   slow_SC = 2 / (ATR_Period + 1)                                  |
+//|   SC_raw  = ER * (fast_SC - slow_SC) + slow_SC                    |
+//|   SC      = SC_raw^2                                              |
+//+------------------------------------------------------------------+
+double CalculateKAMASC()
+{
+   double er     = GetERValue();
+   double fastSC = 2.0 / (KAMA_FastPeriod + 1.0);
+   double slowSC = 2.0 / (ATR_Period + 1.0);
+   double scRaw  = er * (fastSC - slowSC) + slowSC;
+   return scRaw * scRaw;  // SC = SC_raw^2
+}
+
+//+------------------------------------------------------------------+
+//| V2.0 TP Formula: KAMA-adaptive take profit distance               |
+//|   TP_dist = ATR * ProfitTargetFactor *                            |
+//|             [1 + (ER * ProfitTargetFactor) / KAMA_FastPeriod]     |
+//|   Sell TP = entryPrice - TP_dist                                  |
+//|   Buy  TP = entryPrice + TP_dist                                  |
+//+------------------------------------------------------------------+
+double CalculateAdaptiveTP(double entryPrice, bool isBuy)
+{
+   double atr        = GetATRPrice();
+   double er         = GetERValue();
+   double multiplier = ProfitTargetFactor * (1.0 + (er * ProfitTargetFactor) / KAMA_FastPeriod);
+   double tpDist     = atr * multiplier;
+
+   if(isBuy)
+      return NormalizeDouble(entryPrice + tpDist, Digits);
+   else
+      return NormalizeDouble(entryPrice - tpDist, Digits);
+}
+
+//+------------------------------------------------------------------+
 //| Helper: Check if spread filter passes                             |
 //+------------------------------------------------------------------+
 bool CheckSpreadFilter()
@@ -265,14 +316,6 @@ bool CheckATRFilter()
       return false;
    }
    return true;
-}
-
-//+------------------------------------------------------------------+
-//| Helper: Get Efficiency Ratio value (chart timeframe)              |
-//+------------------------------------------------------------------+
-double GetERValue()
-{
-   return iCustom(Symbol(), Period(), ER_IndicatorName, ER_Period, 0, 1);
 }
 
 //+------------------------------------------------------------------+
@@ -467,12 +510,8 @@ int PlaceSellStop(double value5)
    double slPrice    = NormalizeDouble(value5 + g_halfRisk, Digits);
    double lots       = CalculateLotSize(PipsToRisk);
 
-   // Calculate TP from ATR
-   double atrPrice = GetATRPrice();
-   double tpPrice  = NormalizeDouble(entryPrice - atrPrice * ProfitTargetFactor, Digits);
-
-   Log(StringFormat("SELL TP calc: ATR_Period=%d, ATR_price=%.5f, Factor=%.2f, TP=%.5f",
-       ATR_Period, atrPrice, ProfitTargetFactor, tpPrice));
+   // V2.0: KAMA-adaptive TP formula
+   double tpPrice = CalculateAdaptiveTP(entryPrice, false);
 
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
@@ -516,12 +555,8 @@ int PlaceBuyStop(double value6)
    double slPrice    = NormalizeDouble(value6 - g_halfRisk, Digits);
    double lots       = CalculateLotSize(PipsToRisk);
 
-   // Calculate TP from ATR
-   double atrPrice = GetATRPrice();
-   double tpPrice  = NormalizeDouble(entryPrice + atrPrice * ProfitTargetFactor, Digits);
-
-   Log(StringFormat("BUY TP calc: ATR_Period=%d, ATR_price=%.5f, Factor=%.2f, TP=%.5f",
-       ATR_Period, atrPrice, ProfitTargetFactor, tpPrice));
+   // V2.0: KAMA-adaptive TP formula
+   double tpPrice = CalculateAdaptiveTP(entryPrice, true);
 
    // Minimum distance check
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
@@ -806,13 +841,39 @@ void MonitorOrderStates()
 }
 
 //+------------------------------------------------------------------+
-//| Manage breakeven and trailing stop for open positions             |
+//| V2.0: Recalculate adaptive trail distance on each chart bar       |
+//|   distance = TrailSCCoef * SC * ATR                               |
+//|   SC = SC_raw^2, SC_raw = ER*(fast_SC - slow_SC) + slow_SC        |
+//|   Called once per chart-timeframe bar close.                      |
+//+------------------------------------------------------------------+
+void RecalculateTrailDistance()
+{
+   double atr = GetATRPrice();
+   double er  = GetERValue();
+
+   // Guard: skip if indicators are not ready
+   if(atr <= 0.0 || er <= 0.0 || er == EMPTY_VALUE)
+   {
+      Log("Trail distance recalculation skipped: ATR or ER not ready");
+      return;
+   }
+
+   double sc = CalculateKAMASC();
+   g_trailDistancePrice = TrailSCCoef * sc * atr;
+
+   Log(StringFormat("Trail distance recalculated: %.5f price units (ER=%.4f, SC=%.6f, ATR=%.5f, Coef=%.2f)",
+       g_trailDistancePrice, er, sc, atr, TrailSCCoef));
+}
+
+//+------------------------------------------------------------------+
+//| V2.0: Manage breakeven and adaptive trailing stop                 |
+//|   Activation : fixed TrailActivationPips (default 70 pips)        |
+//|   Distance   : g_trailDistancePrice (recalculated per bar)        |
 //+------------------------------------------------------------------+
 void ManageOpenPositions()
 {
-   double atrPips = GetATRPips();
+   double atrPips            = GetATRPips();
    double breakevenThreshold = atrPips * BreakevenTriggerFactor;
-   double trailTriggerThreshold = atrPips * TrailTriggerFactor;
 
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
@@ -846,14 +907,14 @@ void ManageOpenPositions()
             }
          }
 
-         // Trailing stop (triggered at ATR * TrailTriggerFactor)
-         if(EnableTrailingStop && profitPips >= trailTriggerThreshold)
+         // V2.0 Trailing stop: fixed pip activation, adaptive SC-based distance
+         if(EnableTrailingStop && profitPips >= TrailActivationPips && g_trailDistancePrice > 0)
          {
-            double trailSL = NormalizeDouble(Bid - TrailDistancePips * g_pipSize, Digits);
+            double trailSL = NormalizeDouble(Bid - g_trailDistancePrice, Digits);
             if(trailSL > newSL || newSL == 0)
             {
-               Log(StringFormat("TRAILING BUY #%d: Moving SL to %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f], trail=%.1f pips)",
-                   OrderTicket(), trailSL, profitPips, trailTriggerThreshold, TrailTriggerFactor, TrailDistancePips));
+               Log(StringFormat("TRAILING BUY #%d: Moving SL to %.5f (profit=%.1f pips, activation=%.1f pips, trail_dist=%.5f)",
+                   OrderTicket(), trailSL, profitPips, TrailActivationPips, g_trailDistancePrice));
                newSL = trailSL;
             }
          }
@@ -875,20 +936,20 @@ void ManageOpenPositions()
             }
          }
 
-         // Trailing stop (triggered at ATR * TrailTriggerFactor)
-         if(EnableTrailingStop && profitPips >= trailTriggerThreshold)
+         // V2.0 Trailing stop: fixed pip activation, adaptive SC-based distance
+         if(EnableTrailingStop && profitPips >= TrailActivationPips && g_trailDistancePrice > 0)
          {
-            double trailSL = NormalizeDouble(Ask + TrailDistancePips * g_pipSize, Digits);
+            double trailSL = NormalizeDouble(Ask + g_trailDistancePrice, Digits);
             if(trailSL < newSL || newSL == 0)
             {
-               Log(StringFormat("TRAILING SELL #%d: Moving SL to %.5f (profit=%.1f pips, trigger=%.1f pips [ATR*%.2f], trail=%.1f pips)",
-                   OrderTicket(), trailSL, profitPips, trailTriggerThreshold, TrailTriggerFactor, TrailDistancePips));
+               Log(StringFormat("TRAILING SELL #%d: Moving SL to %.5f (profit=%.1f pips, activation=%.1f pips, trail_dist=%.5f)",
+                   OrderTicket(), trailSL, profitPips, TrailActivationPips, g_trailDistancePrice));
                newSL = trailSL;
             }
          }
       }
 
-      // Apply SL modification if changed
+      // Apply SL modification if changed — preserve current TP
       if(MathAbs(newSL - currentSL) > Point && newSL != 0)
       {
          if(!OrderModify(OrderTicket(), openPrice, newSL, OrderTakeProfit(), 0, clrYellow))
@@ -901,25 +962,96 @@ void ManageOpenPositions()
 }
 
 //+------------------------------------------------------------------+
+//| V2.0: Update TP dynamically every tick for open positions         |
+//|   TP recalculated using current ATR and ER (shift 1 = last bar)   |
+//|   Only calls OrderModify when TP changes by at least 1 pip.       |
+//+------------------------------------------------------------------+
+void UpdateDynamicTP()
+{
+   // Guard: skip if indicators are not ready
+   double atrCheck = GetATRPrice();
+   double erCheck  = GetERValue();
+   if(atrCheck <= 0.0 || erCheck <= 0.0 || erCheck == EMPTY_VALUE)
+      return;
+
+   double stopLevel = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         continue;
+      if(OrderSymbol() != Symbol() || OrderMagicNumber() != MagicNumber)
+         continue;
+
+      int type = OrderType();
+      if(type != OP_BUY && type != OP_SELL)
+         continue;
+
+      bool   isBuy      = (type == OP_BUY);
+      double openPrice  = OrderOpenPrice();
+      double currentTP  = OrderTakeProfit();
+      double newTP      = CalculateAdaptiveTP(openPrice, isBuy);
+
+      // Sanity check: TP must be a minimum broker distance from current price
+      if(isBuy)
+      {
+         if(newTP - Ask < stopLevel)
+         {
+            Log(StringFormat("Dynamic TP for BUY #%d skipped: newTP=%.5f too close to Ask=%.5f (minDist=%.5f)",
+                OrderTicket(), newTP, Ask, stopLevel));
+            continue;
+         }
+      }
+      else
+      {
+         if(Bid - newTP < stopLevel)
+         {
+            Log(StringFormat("Dynamic TP for SELL #%d skipped: newTP=%.5f too close to Bid=%.5f (minDist=%.5f)",
+                OrderTicket(), newTP, Bid, stopLevel));
+            continue;
+         }
+      }
+
+      // Only modify if TP changed by more than 1 pip to avoid broker spam
+      if(MathAbs(newTP - currentTP) > g_pipSize)
+      {
+         if(!OrderModify(OrderTicket(), openPrice, OrderStopLoss(), newTP, 0, clrCyan))
+         {
+            Log(StringFormat("FAILED to update dynamic TP for #%d: newTP=%.5f, error=%d",
+                OrderTicket(), newTP, GetLastError()));
+         }
+         else
+         {
+            Log(StringFormat("DYNAMIC TP updated #%d: TP %.5f → %.5f (ATR=%.5f, ER=%.4f)",
+                OrderTicket(), currentTP, newTP, GetATRPrice(), GetERValue()));
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Log("=== HiLo Breakout EA Starting ===");
+   Log("=== HiLo Breakout EA v2.00 Starting ===");
    Log(StringFormat("Symbol: %s, Digits: %d, Point: %s", Symbol(), Digits, DoubleToStr(Point, Digits)));
    Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d",
        PipsToRisk, MaxSpreadPips, ATR_Period));
    Log(StringFormat("ATR Filter: %s, Min=%.1f pips", (EnableATRFilter ? "ON" : "OFF"), ATR_MinValue));
+   Log(StringFormat("KAMA: FastPeriod=%d, SlowPeriod=%d (ATR_Period)", KAMA_FastPeriod, ATR_Period));
    Log(StringFormat("ER Layer 1 (block orders): %s, Min=%.2f | Layer 2 (delete pending): %s, Min=%.2f | Period=%d, Indicator=%s",
        (EnableER_Layer1 ? "ON" : "OFF"), ER_Layer1_MinValue,
        (EnableER_Layer2 ? "ON" : "OFF"), ER_Layer2_MinValue,
        ER_Period, ER_IndicatorName));
-   Log(StringFormat("Profit Target Factor: %.2f (x ATR)", ProfitTargetFactor));
+   Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
+       ProfitTargetFactor));
+   Log(StringFormat("V2.0 Dynamic TP: recalculated EVERY TICK for open positions"));
+   Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar)",
+       (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
    Log(StringFormat("Breakeven: %s, Trigger Factor=%.2f (x ATR)", (EnableBreakeven ? "ON" : "OFF"), BreakevenTriggerFactor));
-   Log(StringFormat("Trailing Stop: %s, Trigger Factor=%.2f (x ATR), Distance=%.1f pips",
-       (EnableTrailingStop ? "ON" : "OFF"), TrailTriggerFactor, TrailDistancePips));
    Log(StringFormat("Magic: %d, Comment: %s", MagicNumber, OrderComment));
 
    // Calculate pip size
@@ -927,17 +1059,22 @@ int OnInit()
 
    // Calculate half risk in price terms
    g_halfRisk = (PipsToRisk / 2.0) * g_pipSize;
-   Log(StringFormat("Half risk in price: %s (%0.1f pips)", DoubleToStr(g_halfRisk, Digits), PipsToRisk / 2.0));
+   Log(StringFormat("Half risk in price: %s (%.1f pips)", DoubleToStr(g_halfRisk, Digits), PipsToRisk / 2.0));
 
    // Initialize state
-   g_sellTicket        = -1;
-   g_buyTicket         = -1;
-   g_lastSellValue5    = 0;
-   g_lastBuyValue6     = 0;
-   g_sellWaitingSignal = false;
-   g_buyWaitingSignal  = false;
-   g_breakevenApplied  = false;
-   g_lastM30Bar        = iTime(Symbol(), PERIOD_M30, 0);
+   g_sellTicket          = -1;
+   g_buyTicket           = -1;
+   g_lastSellValue5      = 0;
+   g_lastBuyValue6       = 0;
+   g_sellWaitingSignal   = false;
+   g_buyWaitingSignal    = false;
+   g_breakevenApplied    = false;
+   g_lastM30Bar          = iTime(Symbol(), PERIOD_M30, 0);
+   g_lastChartBar        = iTime(Symbol(), Period(), 0);
+   g_trailDistancePrice  = 0.0;
+
+   // Compute initial adaptive trail distance
+   RecalculateTrailDistance();
 
    // Check for any existing orders from previous runs
    int existingSell = FindPendingTicket(OP_SELLSTOP);
@@ -975,7 +1112,7 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Log(StringFormat("=== HiLo Breakout EA Stopping (reason=%d) ===", reason));
+   Log(StringFormat("=== HiLo Breakout EA v2.00 Stopping (reason=%d) ===", reason));
 }
 
 //+------------------------------------------------------------------+
@@ -986,7 +1123,10 @@ void OnTick()
    // Monitor order states every tick (check for SL hits, closures)
    MonitorOrderStates();
 
-   // Manage breakeven and trailing stop for open positions
+   // V2.0: Update TP dynamically every tick for open positions
+   UpdateDynamicTP();
+
+   // Manage breakeven and adaptive trailing stop for open positions
    ManageOpenPositions();
 
    // ER Layer 2: delete pending orders if ER drops below threshold
@@ -1010,12 +1150,21 @@ void OnTick()
       }
    }
 
-   // Check for new M30 candle close
-   datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);
+   // Check for new chart-timeframe bar close → recalculate trail distance
+   datetime currentChartBar = iTime(Symbol(), Period(), 0);
+   if(currentChartBar != g_lastChartBar)
+   {
+      g_lastChartBar = currentChartBar;
+      Log(StringFormat("--- Chart bar closed at %s ---", TimeToStr(currentChartBar, TIME_DATE | TIME_MINUTES)));
 
+      // V2.0: Recalculate adaptive trail distance once per bar
+      RecalculateTrailDistance();
+   }
+
+   // Check for new M30 candle close → scan for new indicator signals
+   datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);
    if(currentM30Bar != g_lastM30Bar)
    {
-      // New M30 candle has opened - the previous one just closed
       g_lastM30Bar = currentM30Bar;
       Log(StringFormat("--- M30 candle closed at %s ---", TimeToStr(currentM30Bar, TIME_DATE | TIME_MINUTES)));
 

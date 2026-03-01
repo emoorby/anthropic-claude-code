@@ -1046,7 +1046,7 @@ int OnInit()
        ER_Period, ER_IndicatorName));
    Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
        ProfitTargetFactor));
-   Log(StringFormat("V2.0 Dynamic TP: recalculated EVERY TICK for open positions"));
+   Log("V2.0 Dynamic TP: recalculated EVERY TICK for open positions");
    Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar)",
        (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",

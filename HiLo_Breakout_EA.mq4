@@ -5,7 +5,7 @@
 //+------------------------------------------------------------------+
 #property copyright "HiLo Breakout EA"
 #property link      ""
-#property version   "2.00"
+#property version   "2.10"
 #property strict
 
 //+------------------------------------------------------------------+
@@ -62,6 +62,16 @@ input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
 input double      TrailActivationPips  = 70.0;        // Trailing Activation Threshold (pips profit)
 input double      TrailSCCoef          = 1.7;         // Trail Distance Coefficient (x SC x ATR)
 
+// --- Entry Method Selection ---
+input bool        UseZZSemaforMethod   = true;        // Enable ZZ Semafor entry method
+input bool        UseATRCandleMethod   = false;       // Enable ATR Candle breakout method
+
+// --- ATR Candle Method ---
+input ENUM_TIMEFRAMES ATRCandle_TF         = PERIOD_H1; // ATR Candle: Signal Timeframe
+input int         ATRCandle_ATRPeriod      = 14;         // ATR Candle: ATR Period
+input double      ATRCandle_Multiplier     = 2.0;        // ATR Candle: Candle size minimum (x ATR)
+input double      ATRCandle_ClosePct       = 30.0;       // ATR Candle: Max close dist from extreme (%)
+
 // --- Lot Sizing ---
 input ENUM_LOT_MODE LotMode            = LOT_MODE_FIXED; // Lot Sizing Mode
 input double      FixedLots            = 0.1;        // Fixed Lot Size
@@ -89,6 +99,8 @@ bool     g_buyWaitingSignal;    // waiting for new Value6 after SL/close
 bool     g_breakevenApplied;    // breakeven already moved for current position
 
 double   g_trailDistancePrice;  // adaptive trail distance in price terms (updated per chart bar)
+
+datetime g_lastATRCandleBar;    // last bar time processed by ATR Candle method
 
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
@@ -1030,11 +1042,160 @@ void UpdateDynamicTP()
 }
 
 //+------------------------------------------------------------------+
+//| ATR Candle: Draw label above signal candle                        |
+//|   Shows ATR value and candle size at the time of the signal.      |
+//+------------------------------------------------------------------+
+void DrawATRCandleLabel(datetime barTime, double candleHigh, double atrValue,
+                        double candleSize, bool isBuy)
+{
+   string objName   = "ATRCandle_" + IntegerToString((int)barTime);
+   string labelText = StringFormat("ATR:%.2f  Sz:%.2f", atrValue, candleSize);
+   double labelPrice = candleHigh + 10.0 * g_pipSize;
+   color  labelColor = isBuy ? clrDodgerBlue : clrOrangeRed;
+
+   ObjectDelete(objName);
+
+   if(!ObjectCreate(objName, OBJ_TEXT, 0, barTime, labelPrice))
+   {
+      Log(StringFormat("ATR Candle label create failed: error=%d", GetLastError()));
+      return;
+   }
+
+   ObjectSetText(objName, labelText, 8, "Arial", labelColor);
+}
+
+//+------------------------------------------------------------------+
+//| ATR Candle: Remove all chart labels created by this method        |
+//+------------------------------------------------------------------+
+void DeleteAllATRCandleObjects()
+{
+   for(int i = ObjectsTotal() - 1; i >= 0; i--)
+   {
+      string name = ObjectName(i);
+      if(StringFind(name, "ATRCandle_") == 0)
+         ObjectDelete(name);
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ATR Candle: Place market order with SL at opposite candle end     |
+//+------------------------------------------------------------------+
+bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
+                               datetime barTime, double atrValue, double candleSize)
+{
+   if(!CheckSpreadFilter())
+      return false;
+
+   double entryPrice = isBuy ? Ask : Bid;
+   double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
+   double slDistance = MathAbs(entryPrice - slPrice);
+
+   if(slDistance < stopLevel)
+   {
+      Log(StringFormat("ATR Candle %s rejected: SL too close. Dist=%.5f, Min=%.5f",
+          isBuy ? "BUY" : "SELL", slDistance, stopLevel));
+      return false;
+   }
+
+   double slPips  = slDistance / g_pipSize;
+   double lots    = CalculateLotSize(slPips);
+   double tpPrice = CalculateAdaptiveTP(entryPrice, isBuy);
+
+   int ticket = OrderSend(Symbol(), isBuy ? OP_BUY : OP_SELL, lots, entryPrice, 3,
+                          slPrice, tpPrice, OrderComment, MagicNumber, 0,
+                          isBuy ? clrBlue : clrRed);
+
+   if(ticket > 0)
+   {
+      Log(StringFormat("ATR Candle %s #%d: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, ATR=%.5f, CandleSz=%.5f",
+          isBuy ? "BUY" : "SELL", ticket, entryPrice, slPrice, tpPrice, lots,
+          atrValue, candleSize));
+      DrawATRCandleLabel(barTime, candleHigh, atrValue, candleSize, isBuy);
+      return true;
+   }
+
+   Log(StringFormat("ATR Candle %s FAILED: Entry=%.5f, SL=%.5f, TP=%.5f, Error=%d",
+       isBuy ? "BUY" : "SELL", entryPrice, slPrice, tpPrice, GetLastError()));
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| ATR Candle: Scan signal timeframe for new bar and check signal    |
+//|   Signal : candle range > ATRCandle_Multiplier * ATR(period)      |
+//|   Buy    : bullish candle, close within ATRCandle_ClosePct% of high|
+//|   Sell   : bearish candle, close within ATRCandle_ClosePct% of low |
+//|   Entry  : market order; SL at opposite candle extreme            |
+//+------------------------------------------------------------------+
+void MonitorATRCandleSignals()
+{
+   datetime currentBar = iTime(Symbol(), ATRCandle_TF, 0);
+   if(currentBar == g_lastATRCandleBar)
+      return;  // no new bar yet
+
+   g_lastATRCandleBar = currentBar;
+
+   // Signal candle = last closed bar (shift 1) on signal timeframe
+   double candleHigh  = iHigh(Symbol(),  ATRCandle_TF, 1);
+   double candleLow   = iLow(Symbol(),   ATRCandle_TF, 1);
+   double candleOpen  = iOpen(Symbol(),  ATRCandle_TF, 1);
+   double candleClose = iClose(Symbol(), ATRCandle_TF, 1);
+   datetime barTime   = iTime(Symbol(),  ATRCandle_TF, 1);
+
+   double candleRange = candleHigh - candleLow;
+   if(candleRange <= 0)
+      return;
+
+   double atrValue = iATR(Symbol(), ATRCandle_TF, ATRCandle_ATRPeriod, 1);
+   if(atrValue <= 0)
+      return;
+
+   // Size condition: full range must exceed multiplier * ATR
+   if(candleRange <= ATRCandle_Multiplier * atrValue)
+      return;
+
+   bool isBull = (candleClose > candleOpen);
+   bool isBear = (candleClose < candleOpen);
+
+   if(isBull)
+   {
+      // Close proximity: close must be within ATRCandle_ClosePct% of the high
+      double distPct = (candleHigh - candleClose) / candleRange * 100.0;
+      if(distPct > ATRCandle_ClosePct)
+      {
+         Log(StringFormat("ATR Candle BUY skipped: close %.1f%% from high > limit %.1f%%",
+             distPct, ATRCandle_ClosePct));
+         return;
+      }
+
+      Log(StringFormat("ATR Candle BUY signal: Range=%.5f, ATR=%.5f (x%.2f), ClosePct=%.1f%%",
+          candleRange, atrValue, candleRange / atrValue, distPct));
+      PlaceATRCandleMarketOrder(true, candleLow, candleHigh, barTime, atrValue, candleRange);
+   }
+   else if(isBear)
+   {
+      // Close proximity: close must be within ATRCandle_ClosePct% of the low
+      double distPct = (candleClose - candleLow) / candleRange * 100.0;
+      if(distPct > ATRCandle_ClosePct)
+      {
+         Log(StringFormat("ATR Candle SELL skipped: close %.1f%% from low > limit %.1f%%",
+             distPct, ATRCandle_ClosePct));
+         return;
+      }
+
+      Log(StringFormat("ATR Candle SELL signal: Range=%.5f, ATR=%.5f (x%.2f), ClosePct=%.1f%%",
+          candleRange, atrValue, candleRange / atrValue, distPct));
+      PlaceATRCandleMarketOrder(false, candleHigh, candleHigh, barTime, atrValue, candleRange);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Expert initialization function                                    |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Log("=== HiLo Breakout EA v2.00 Starting ===");
+   Log("=== HiLo Breakout EA v2.10 Starting ===");
+   Log(StringFormat("Entry Methods: ZZ Semafor=%s, ATR Candle=%s",
+       (UseZZSemaforMethod ? "ON" : "OFF"), (UseATRCandleMethod ? "ON" : "OFF")));
    Log(StringFormat("Symbol: %s, Digits: %d, Point: %s", Symbol(), Digits, DoubleToStr(Point, Digits)));
    Log(StringFormat("Settings: PipsToRisk=%.1f, MaxSpread=%.1f, ATR_Period=%d",
        PipsToRisk, MaxSpreadPips, ATR_Period));
@@ -1044,6 +1205,9 @@ int OnInit()
        (EnableER_Layer1 ? "ON" : "OFF"), ER_Layer1_MinValue,
        (EnableER_Layer2 ? "ON" : "OFF"), ER_Layer2_MinValue,
        ER_Period, ER_IndicatorName));
+   if(UseATRCandleMethod)
+      Log(StringFormat("ATR Candle: TF=%s, ATRPeriod=%d, Multiplier=%.2f, ClosePct=%.1f%%",
+          EnumToString(ATRCandle_TF), ATRCandle_ATRPeriod, ATRCandle_Multiplier, ATRCandle_ClosePct));
    Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
        ProfitTargetFactor));
    Log("V2.0 Dynamic TP: recalculated EVERY TICK for open positions");
@@ -1072,36 +1236,39 @@ int OnInit()
    g_lastM30Bar          = iTime(Symbol(), PERIOD_M30, 0);
    g_lastChartBar        = iTime(Symbol(), Period(), 0);
    g_trailDistancePrice  = 0.0;
+   g_lastATRCandleBar    = iTime(Symbol(), ATRCandle_TF, 0);
 
    // Compute initial adaptive trail distance
    RecalculateTrailDistance();
 
-   // Check for any existing orders from previous runs
-   int existingSell = FindPendingTicket(OP_SELLSTOP);
-   int existingBuy  = FindPendingTicket(OP_BUYSTOP);
-
-   if(existingSell > 0 || existingBuy > 0)
+   // ZZ Semafor: check for existing pending orders and seed initial signals
+   if(UseZZSemaforMethod)
    {
-      Log(StringFormat("Found existing orders: SellStop=#%d, BuyStop=#%d", existingSell, existingBuy));
-      g_sellTicket = existingSell;
-      g_buyTicket  = existingBuy;
+      int existingSell = FindPendingTicket(OP_SELLSTOP);
+      int existingBuy  = FindPendingTicket(OP_BUYSTOP);
 
-      // Recover last values used
-      if(existingSell > 0)
+      if(existingSell > 0 || existingBuy > 0)
       {
-         int shift = -1;
-         g_lastSellValue5 = FindMostRecentValue(BUF_VALUE5, shift);
+         Log(StringFormat("Found existing orders: SellStop=#%d, BuyStop=#%d", existingSell, existingBuy));
+         g_sellTicket = existingSell;
+         g_buyTicket  = existingBuy;
+
+         // Recover last signal values
+         if(existingSell > 0)
+         {
+            int shift = -1;
+            g_lastSellValue5 = FindMostRecentValue(BUF_VALUE5, shift);
+         }
+         if(existingBuy > 0)
+         {
+            int shift = -1;
+            g_lastBuyValue6 = FindMostRecentValue(BUF_VALUE6, shift);
+         }
       }
-      if(existingBuy > 0)
+      else
       {
-         int shift = -1;
-         g_lastBuyValue6 = FindMostRecentValue(BUF_VALUE6, shift);
+         PlaceInitialOrders();
       }
-   }
-   else
-   {
-      // No existing orders - place initial ones
-      PlaceInitialOrders();
    }
 
    return INIT_SUCCEEDED;
@@ -1112,7 +1279,8 @@ int OnInit()
 //+------------------------------------------------------------------+
 void OnDeinit(const int reason)
 {
-   Log(StringFormat("=== HiLo Breakout EA v2.00 Stopping (reason=%d) ===", reason));
+   Log(StringFormat("=== HiLo Breakout EA v2.10 Stopping (reason=%d) ===", reason));
+   DeleteAllATRCandleObjects();
 }
 
 //+------------------------------------------------------------------+
@@ -1120,17 +1288,18 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   // Monitor order states every tick (check for SL hits, closures)
-   MonitorOrderStates();
+   // ZZ Semafor: monitor pending order states every tick
+   if(UseZZSemaforMethod)
+      MonitorOrderStates();
 
-   // V2.0: Update TP dynamically every tick for open positions
+   // V2.0: Update TP dynamically every tick for all open positions
    UpdateDynamicTP();
 
-   // Manage breakeven and adaptive trailing stop for open positions
+   // Manage breakeven and adaptive trailing stop for all open positions
    ManageOpenPositions();
 
-   // ER Layer 2: delete pending orders if ER drops below threshold
-   if(EnableER_Layer2)
+   // ZZ Semafor: ER Layer 2 — delete pending orders if ER drops below threshold
+   if(UseZZSemaforMethod && EnableER_Layer2)
    {
       double erValue = GetERValue();
       if(erValue < ER_Layer2_MinValue)
@@ -1150,26 +1319,29 @@ void OnTick()
       }
    }
 
-   // Check for new chart-timeframe bar close → recalculate trail distance
+   // Chart bar close: recalculate adaptive trail distance (all methods)
    datetime currentChartBar = iTime(Symbol(), Period(), 0);
    if(currentChartBar != g_lastChartBar)
    {
       g_lastChartBar = currentChartBar;
       Log(StringFormat("--- Chart bar closed at %s ---", TimeToStr(currentChartBar, TIME_DATE | TIME_MINUTES)));
-
-      // V2.0: Recalculate adaptive trail distance once per bar
       RecalculateTrailDistance();
    }
 
-   // Check for new M30 candle close → scan for new indicator signals
-   datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);
-   if(currentM30Bar != g_lastM30Bar)
+   // ZZ Semafor: M30 bar close → scan for new indicator signals
+   if(UseZZSemaforMethod)
    {
-      g_lastM30Bar = currentM30Bar;
-      Log(StringFormat("--- M30 candle closed at %s ---", TimeToStr(currentM30Bar, TIME_DATE | TIME_MINUTES)));
-
-      // Monitor for new signals
-      MonitorM30Candle();
+      datetime currentM30Bar = iTime(Symbol(), PERIOD_M30, 0);
+      if(currentM30Bar != g_lastM30Bar)
+      {
+         g_lastM30Bar = currentM30Bar;
+         Log(StringFormat("--- M30 candle closed at %s ---", TimeToStr(currentM30Bar, TIME_DATE | TIME_MINUTES)));
+         MonitorM30Candle();
+      }
    }
+
+   // ATR Candle method: check signal timeframe for breakout signals
+   if(UseATRCandleMethod)
+      MonitorATRCandleSignals();
 }
 //+------------------------------------------------------------------+

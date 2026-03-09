@@ -288,8 +288,13 @@ double CalculateKAMASC()
 //+------------------------------------------------------------------+
 double CalculateAdaptiveTP(double entryPrice, bool isBuy)
 {
-   double atr        = GetATRPrice();
-   double er         = GetERValue();
+   double atr = GetATRPrice();
+   double er  = GetERValue();
+
+   // Guard: if ER unavailable, fall back to base factor (no adaptive adjustment)
+   if(er <= 0.0 || er == EMPTY_VALUE)
+      er = 0.0;
+
    double multiplier = ProfitTargetFactor * (1.0 + (er * ProfitTargetFactor) / KAMA_FastPeriod);
    double tpDist     = atr * multiplier;
 
@@ -1133,6 +1138,13 @@ void MonitorATRCandleSignals()
       return;  // no new bar yet
 
    g_lastATRCandleBar = currentBar;
+
+   // Do not open a new trade while one is already open
+   if(CountOpenPositions() > 0)
+   {
+      Log("ATR Candle: position already open - skipping signal check");
+      return;
+   }
 
    // Signal candle = last closed bar (shift 1) on signal timeframe
    double candleHigh  = iHigh(Symbol(),  ATRCandle_TF, 1);

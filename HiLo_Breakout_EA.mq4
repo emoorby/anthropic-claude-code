@@ -61,6 +61,7 @@ input double      BreakevenTriggerFactor = 0.75;      // Breakeven Trigger Facto
 input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
 input double      TrailActivationPips  = 70.0;        // Trailing Activation Threshold (pips profit)
 input double      TrailSCCoef          = 1.7;         // Trail Distance Coefficient (x SC x ATR)
+input int         MinModifyIntervalSec = 10;          // Min seconds between SL/TP modifications
 
 // --- Entry Method Selection ---
 input bool        UseZZSemaforMethod   = true;        // Enable ZZ Semafor entry method
@@ -101,6 +102,7 @@ bool     g_breakevenApplied;    // breakeven already moved for current position
 double   g_trailDistancePrice;  // adaptive trail distance in price terms (updated per chart bar)
 
 datetime g_lastATRCandleBar;    // last bar time processed by ATR Candle method
+datetime g_lastSLModifyTime;    // throttle: last time SL was modified (seconds)
 
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
@@ -966,13 +968,21 @@ void ManageOpenPositions()
          }
       }
 
-      // Apply SL modification if changed — preserve current TP
-      if(MathAbs(newSL - currentSL) > Point && newSL != 0)
+      // Apply SL modification if changed by at least 1 pip — preserve current TP
+      // Throttle: respect minimum interval between modifications to avoid broker overload
+      if(MathAbs(newSL - currentSL) > g_pipSize && newSL != 0)
       {
+         if(TimeCurrent() - g_lastSLModifyTime < MinModifyIntervalSec)
+            continue;
+
          if(!OrderModify(OrderTicket(), openPrice, newSL, OrderTakeProfit(), 0, clrYellow))
          {
             Log(StringFormat("FAILED to modify SL for #%d: newSL=%.5f, error=%d",
                 OrderTicket(), newSL, GetLastError()));
+         }
+         else
+         {
+            g_lastSLModifyTime = TimeCurrent();
          }
       }
    }
@@ -1223,8 +1233,8 @@ int OnInit()
    Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
        ProfitTargetFactor));
    Log("V2.0 Dynamic TP: recalculated EVERY TICK for open positions");
-   Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar)",
-       (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef));
+   Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar) | MinModifyInterval=%ds",
+       (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef, MinModifyIntervalSec));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
    Log(StringFormat("Breakeven: %s, Trigger Factor=%.2f (x ATR)", (EnableBreakeven ? "ON" : "OFF"), BreakevenTriggerFactor));
@@ -1249,6 +1259,7 @@ int OnInit()
    g_lastChartBar        = iTime(Symbol(), Period(), 0);
    g_trailDistancePrice  = 0.0;
    g_lastATRCandleBar    = iTime(Symbol(), ATRCandle_TF, 0);
+   g_lastSLModifyTime    = 0;
 
    // Compute initial adaptive trail distance
    RecalculateTrailDistance();
@@ -1304,9 +1315,6 @@ void OnTick()
    if(UseZZSemaforMethod)
       MonitorOrderStates();
 
-   // V2.0: Update TP dynamically every tick for all open positions
-   UpdateDynamicTP();
-
    // Manage breakeven and adaptive trailing stop for all open positions
    ManageOpenPositions();
 
@@ -1331,13 +1339,16 @@ void OnTick()
       }
    }
 
-   // Chart bar close: recalculate adaptive trail distance (all methods)
+   // Chart bar close: recalculate adaptive trail distance and dynamic TP
    datetime currentChartBar = iTime(Symbol(), Period(), 0);
    if(currentChartBar != g_lastChartBar)
    {
       g_lastChartBar = currentChartBar;
       Log(StringFormat("--- Chart bar closed at %s ---", TimeToStr(currentChartBar, TIME_DATE | TIME_MINUTES)));
       RecalculateTrailDistance();
+
+      // V2.0: Update TP on bar close (ATR/ER at shift 1 only change on bar close)
+      UpdateDynamicTP();
    }
 
    // ZZ Semafor: M30 bar close → scan for new indicator signals

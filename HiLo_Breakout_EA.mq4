@@ -20,63 +20,79 @@ enum ENUM_LOT_MODE
 //+------------------------------------------------------------------+
 //| Input Parameters                                                  |
 //+------------------------------------------------------------------+
-// --- General ---
-input int         MagicNumber          = 123456;     // Magic Number
-input string      OrderComment         = "HiLo_BRK"; // Order Comment
-input bool        EnableLogging        = true;        // Enable Logging
 
-// --- Indicator ---
-input string      IndicatorName        = "!!!3 level zz semafor mtf alerts nmc-pfeil"; // Indicator Name
+input string   _sep_general          = ""; // ═══════════════ GENERAL ═══════════════
+input int      MagicNumber           = 123456;     // Magic Number
+input string   OrderComment          = "HiLo_BRK"; // Order Comment
+input bool     EnableLogging         = true;        // Enable Logging
 
-// --- Trade Parameters ---
-input double      PipsToRisk           = 56.0;       // Pips to Risk (total)
-input double      MaxSpreadPips        = 5.0;        // Max Spread (pips)
+input string   _sep_zzsemafor        = ""; // ══════════ ZZ SEMAFOR ENTRY ═══════════
+input bool     UseZZSemaforMethod    = true;        // Enable ZZ Semafor Entry Method
+input string   IndicatorName         = "!!!3 level zz semafor mtf alerts nmc-pfeil"; // ZZ Semafor Indicator Name
+input string   _sep_er               = ""; // ──────────── Efficiency Ratio ──────────
+input string   ER_IndicatorName      = "SqEfficiencyRatio"; // ER Indicator Name
+input int      ER_Period             = 48;          // ER Period
+input bool     EnableER_Layer1       = true;        // ER Layer 1: Block new orders when ER low
+input double   ER_Layer1_MinValue    = 0.30;        // ER Layer 1: Minimum ER value
+input bool     EnableER_Layer2       = true;        // ER Layer 2: Delete pending orders when ER drops
+input double   ER_Layer2_MinValue    = 0.30;        // ER Layer 2: Minimum ER value
 
-// --- ATR ---
-input int         ATR_Period           = 30;          // ATR Period
-input bool        EnableATRFilter      = true;        // Enable ATR Filter
-input double      ATR_MinValue         = 14.0;        // ATR Minimum Value (pips)
+input string   _sep_atrcandle        = ""; // ══════════ ATR CANDLE ENTRY ════════════
+input bool     UseATRCandleMethod    = false;       // Enable ATR Candle Entry Method
+input ENUM_TIMEFRAMES ATRCandle_TF   = PERIOD_H1;  // ATR Candle: Signal Timeframe
+input int      ATRCandle_ATRPeriod   = 14;          // ATR Candle: ATR Period
+input double   ATRCandle_Multiplier  = 2.0;         // ATR Candle: Candle size minimum (x ATR)
+input double   ATRCandle_ClosePct    = 30.0;        // ATR Candle: Max close distance from extreme (%)
+input string   _sep_tw               = ""; // ──────── ATR Candle: Trading Time Windows ────────
+input bool     ATRCandle_TW1_Enable  = false;       // Time Window 1: Enable
+input int      ATRCandle_TW1_StartH  = 1;           // Time Window 1: Start Hour   (0-23)
+input int      ATRCandle_TW1_StartM  = 0;           // Time Window 1: Start Minute (0-59)
+input int      ATRCandle_TW1_StopH   = 4;           // Time Window 1: Stop Hour    (0-23)
+input int      ATRCandle_TW1_StopM   = 59;          // Time Window 1: Stop Minute  (0-59)
+input bool     ATRCandle_TW2_Enable  = false;       // Time Window 2: Enable
+input int      ATRCandle_TW2_StartH  = 7;           // Time Window 2: Start Hour   (0-23)
+input int      ATRCandle_TW2_StartM  = 0;           // Time Window 2: Start Minute (0-59)
+input int      ATRCandle_TW2_StopH   = 11;          // Time Window 2: Stop Hour    (0-23)
+input int      ATRCandle_TW2_StopM   = 59;          // Time Window 2: Stop Minute  (0-59)
+input bool     ATRCandle_TW3_Enable  = false;       // Time Window 3: Enable
+input int      ATRCandle_TW3_StartH  = 13;          // Time Window 3: Start Hour   (0-23)
+input int      ATRCandle_TW3_StartM  = 0;           // Time Window 3: Start Minute (0-59)
+input int      ATRCandle_TW3_StopH   = 17;          // Time Window 3: Stop Hour    (0-23)
+input int      ATRCandle_TW3_StopM   = 59;          // Time Window 3: Stop Minute  (0-59)
+input bool     ATRCandle_TW4_Enable  = false;       // Time Window 4: Enable
+input int      ATRCandle_TW4_StartH  = 19;          // Time Window 4: Start Hour   (0-23)
+input int      ATRCandle_TW4_StartM  = 0;           // Time Window 4: Start Minute (0-59)
+input int      ATRCandle_TW4_StopH   = 22;          // Time Window 4: Stop Hour    (0-23)
+input int      ATRCandle_TW4_StopM   = 59;          // Time Window 4: Stop Minute  (0-59)
+input bool     ATRCandle_TW5_Enable  = false;       // Time Window 5: Enable
+input int      ATRCandle_TW5_StartH  = 0;           // Time Window 5: Start Hour   (0-23)
+input int      ATRCandle_TW5_StartM  = 0;           // Time Window 5: Start Minute (0-59)
+input int      ATRCandle_TW5_StopH   = 23;          // Time Window 5: Stop Hour    (0-23)
+input int      ATRCandle_TW5_StopM   = 59;          // Time Window 5: Stop Minute  (0-59)
 
-// --- KAMA Settings ---
-input int         KAMA_FastPeriod      = 3;           // KAMA Fast Smoothing Period
+input string   _sep_filters          = ""; // ══════════════ FILTERS ═════════════════
+input double   MaxSpreadPips         = 5.0;         // Max Spread (pips)
+input bool     EnableATRFilter       = true;        // Enable ATR Volatility Filter
+input double   ATR_MinValue          = 14.0;        // ATR Minimum Value (pips)
 
-// --- Efficiency Ratio ---
-input string      ER_IndicatorName     = "SqEfficiencyRatio"; // ER Indicator Name
-input int         ER_Period            = 48;          // ER Period
-// Layer 1: Block new order placement when ER is low
-input bool        EnableER_Layer1      = true;        // Enable ER Layer 1 (block new orders)
-input double      ER_Layer1_MinValue   = 0.30;        // ER Layer 1 Minimum Value
-// Layer 2: Delete existing pending orders if ER drops
-input bool        EnableER_Layer2      = true;        // Enable ER Layer 2 (delete pending orders)
-input double      ER_Layer2_MinValue   = 0.30;        // ER Layer 2 Minimum Value
+input string   _sep_tp               = ""; // ══════════════ PROFIT TARGET ════════════
+input int      ATR_Period            = 30;           // ATR Period (chart timeframe)
+input int      KAMA_FastPeriod       = 3;            // KAMA Fast Smoothing Period
+input double   ProfitTargetFactor    = 4.8;          // Profit Target Factor (x ATR, KAMA-adaptive)
 
-// --- Profit Target ---
-input double      ProfitTargetFactor   = 4.8;         // Profit Target Factor (x ATR, KAMA-adaptive)
+input string   _sep_mgmt             = ""; // ══════════ TRADE MANAGEMENT ════════════
+input int      MinModifyIntervalSec  = 10;           // Min seconds between SL/TP modifications
+input bool     EnableBreakeven       = true;         // Enable Breakeven
+input double   BreakevenTriggerFactor = 0.75;        // Breakeven Trigger Factor (x ATR)
+input bool     EnableTrailingStop    = true;         // Enable Trailing Stop
+input double   TrailActivationPips   = 70.0;         // Trailing Activation Threshold (pips profit)
+input double   TrailSCCoef           = 1.7;          // Trail Distance Coefficient (x SC x ATR)
 
-// --- Breakeven ---
-input bool        EnableBreakeven      = true;        // Enable Breakeven
-input double      BreakevenTriggerFactor = 0.75;      // Breakeven Trigger Factor (x ATR)
-
-// --- Trailing Stop (V2.0: adaptive distance, fixed activation) ---
-input bool        EnableTrailingStop   = true;        // Enable Trailing Stop
-input double      TrailActivationPips  = 70.0;        // Trailing Activation Threshold (pips profit)
-input double      TrailSCCoef          = 1.7;         // Trail Distance Coefficient (x SC x ATR)
-input int         MinModifyIntervalSec = 10;          // Min seconds between SL/TP modifications
-
-// --- Entry Method Selection ---
-input bool        UseZZSemaforMethod   = true;        // Enable ZZ Semafor entry method
-input bool        UseATRCandleMethod   = false;       // Enable ATR Candle breakout method
-
-// --- ATR Candle Method ---
-input ENUM_TIMEFRAMES ATRCandle_TF         = PERIOD_H1; // ATR Candle: Signal Timeframe
-input int         ATRCandle_ATRPeriod      = 14;         // ATR Candle: ATR Period
-input double      ATRCandle_Multiplier     = 2.0;        // ATR Candle: Candle size minimum (x ATR)
-input double      ATRCandle_ClosePct       = 30.0;       // ATR Candle: Max close dist from extreme (%)
-
-// --- Lot Sizing ---
-input ENUM_LOT_MODE LotMode            = LOT_MODE_FIXED; // Lot Sizing Mode
-input double      FixedLots            = 0.1;        // Fixed Lot Size
-input double      RiskPercent          = 1.0;        // Risk Percent of Balance
+input string   _sep_risk             = ""; // ══════════ RISK & POSITION SIZING ══════
+input double   PipsToRisk            = 56.0;         // Pips to Risk - ZZ Semafor (total)
+input ENUM_LOT_MODE LotMode          = LOT_MODE_FIXED; // Lot Sizing Mode
+input double   FixedLots             = 0.1;          // Fixed Lot Size
+input double   RiskPercent           = 1.0;          // Risk Percent of Balance
 
 //+------------------------------------------------------------------+
 //| Global Variables                                                  |
@@ -1135,6 +1151,55 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
 }
 
 //+------------------------------------------------------------------+
+//| ATR Candle: Check if a time falls within a start-stop range      |
+//|   Handles ranges that cross midnight (e.g. 22:00 - 02:00).       |
+//+------------------------------------------------------------------+
+bool IsInTimeRange(int startH, int startM, int stopH, int stopM)
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int current = dt.hour * 60 + dt.min;
+   int start   = startH  * 60 + startM;
+   int stop    = stopH   * 60 + stopM;
+
+   if(start <= stop)
+      return current >= start && current <= stop;
+   else // crosses midnight
+      return current >= start || current <= stop;
+}
+
+//+------------------------------------------------------------------+
+//| ATR Candle: Check if current server time is within any enabled   |
+//|   trading time window.                                            |
+//|   If all windows are disabled, all times are permitted.           |
+//+------------------------------------------------------------------+
+bool IsWithinATRCandleTimeWindow()
+{
+   // No windows enabled → unrestricted trading
+   if(!ATRCandle_TW1_Enable && !ATRCandle_TW2_Enable && !ATRCandle_TW3_Enable &&
+      !ATRCandle_TW4_Enable && !ATRCandle_TW5_Enable)
+      return true;
+
+   if(ATRCandle_TW1_Enable && IsInTimeRange(ATRCandle_TW1_StartH, ATRCandle_TW1_StartM,
+                                            ATRCandle_TW1_StopH,  ATRCandle_TW1_StopM))
+      return true;
+   if(ATRCandle_TW2_Enable && IsInTimeRange(ATRCandle_TW2_StartH, ATRCandle_TW2_StartM,
+                                            ATRCandle_TW2_StopH,  ATRCandle_TW2_StopM))
+      return true;
+   if(ATRCandle_TW3_Enable && IsInTimeRange(ATRCandle_TW3_StartH, ATRCandle_TW3_StartM,
+                                            ATRCandle_TW3_StopH,  ATRCandle_TW3_StopM))
+      return true;
+   if(ATRCandle_TW4_Enable && IsInTimeRange(ATRCandle_TW4_StartH, ATRCandle_TW4_StartM,
+                                            ATRCandle_TW4_StopH,  ATRCandle_TW4_StopM))
+      return true;
+   if(ATRCandle_TW5_Enable && IsInTimeRange(ATRCandle_TW5_StartH, ATRCandle_TW5_StartM,
+                                            ATRCandle_TW5_StopH,  ATRCandle_TW5_StopM))
+      return true;
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
 //| ATR Candle: Scan signal timeframe for new bar and check signal    |
 //|   Signal : candle range > ATRCandle_Multiplier * ATR(period)      |
 //|   Buy    : bullish candle, close within ATRCandle_ClosePct% of high|
@@ -1153,6 +1218,16 @@ void MonitorATRCandleSignals()
    if(CountOpenPositions() > 0)
    {
       Log("ATR Candle: position already open - skipping signal check");
+      return;
+   }
+
+   // Check trading time windows
+   if(!IsWithinATRCandleTimeWindow())
+   {
+      MqlDateTime dt;
+      TimeToStruct(TimeCurrent(), dt);
+      Log(StringFormat("ATR Candle: outside trading time windows (%02d:%02d server time) - skipping",
+          dt.hour, dt.min));
       return;
    }
 
@@ -1228,11 +1303,32 @@ int OnInit()
        (EnableER_Layer2 ? "ON" : "OFF"), ER_Layer2_MinValue,
        ER_Period, ER_IndicatorName));
    if(UseATRCandleMethod)
+   {
       Log(StringFormat("ATR Candle: TF=%s, ATRPeriod=%d, Multiplier=%.2f, ClosePct=%.1f%%",
           EnumToString(ATRCandle_TF), ATRCandle_ATRPeriod, ATRCandle_Multiplier, ATRCandle_ClosePct));
+      bool anyTW = (ATRCandle_TW1_Enable || ATRCandle_TW2_Enable || ATRCandle_TW3_Enable ||
+                    ATRCandle_TW4_Enable || ATRCandle_TW5_Enable);
+      if(!anyTW)
+      {
+         Log("ATR Candle Time Windows: all disabled — trading unrestricted by time");
+      }
+      else
+      {
+         if(ATRCandle_TW1_Enable) Log(StringFormat("ATR Candle TW1: %02d:%02d - %02d:%02d",
+             ATRCandle_TW1_StartH, ATRCandle_TW1_StartM, ATRCandle_TW1_StopH, ATRCandle_TW1_StopM));
+         if(ATRCandle_TW2_Enable) Log(StringFormat("ATR Candle TW2: %02d:%02d - %02d:%02d",
+             ATRCandle_TW2_StartH, ATRCandle_TW2_StartM, ATRCandle_TW2_StopH, ATRCandle_TW2_StopM));
+         if(ATRCandle_TW3_Enable) Log(StringFormat("ATR Candle TW3: %02d:%02d - %02d:%02d",
+             ATRCandle_TW3_StartH, ATRCandle_TW3_StartM, ATRCandle_TW3_StopH, ATRCandle_TW3_StopM));
+         if(ATRCandle_TW4_Enable) Log(StringFormat("ATR Candle TW4: %02d:%02d - %02d:%02d",
+             ATRCandle_TW4_StartH, ATRCandle_TW4_StartM, ATRCandle_TW4_StopH, ATRCandle_TW4_StopM));
+         if(ATRCandle_TW5_Enable) Log(StringFormat("ATR Candle TW5: %02d:%02d - %02d:%02d",
+             ATRCandle_TW5_StartH, ATRCandle_TW5_StartM, ATRCandle_TW5_StopH, ATRCandle_TW5_StopM));
+      }
+   }
    Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
        ProfitTargetFactor));
-   Log("V2.0 Dynamic TP: recalculated EVERY TICK for open positions");
+   Log("V2.0 Dynamic TP: recalculated on each bar close for open positions");
    Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar) | MinModifyInterval=%ds",
        (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef, MinModifyIntervalSec));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",

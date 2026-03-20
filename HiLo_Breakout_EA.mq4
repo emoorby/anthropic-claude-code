@@ -87,6 +87,7 @@ input double   BreakevenTriggerFactor = 0.75;        // Breakeven Trigger Factor
 input bool     EnableTrailingStop    = true;         // Enable Trailing Stop
 input double   TrailActivationPips   = 70.0;         // Trailing Activation Threshold (pips profit)
 input double   TrailSCCoef           = 1.7;          // Trail Distance Coefficient (x SC x ATR)
+input double   MinTrailDistPips      = 25.0;         // Min Trail Distance Floor (pips)
 
 input string   _sep_risk             = ""; // ══════════ RISK & POSITION SIZING ══════
 input double   PipsToRisk            = 56.0;         // Pips to Risk - ZZ Semafor (total)
@@ -893,11 +894,13 @@ void RecalculateTrailDistance()
       return;
    }
 
-   double sc = CalculateKAMASC();
-   g_trailDistancePrice = TrailSCCoef * sc * atr;
+   double sc      = CalculateKAMASC();
+   double scBased = TrailSCCoef * sc * atr;
+   double minDist = MinTrailDistPips * g_pipSize;
+   g_trailDistancePrice = MathMax(scBased, minDist);
 
-   Log(StringFormat("Trail distance recalculated: %.5f price units (ER=%.4f, SC=%.6f, ATR=%.5f, Coef=%.2f)",
-       g_trailDistancePrice, er, sc, atr, TrailSCCoef));
+   Log(StringFormat("Trail distance recalculated: %.5f price units (ER=%.4f, SC=%.6f, ATR=%.5f, Coef=%.2f, SC-based=%.5f, Floor=%.5f)",
+       g_trailDistancePrice, er, sc, atr, TrailSCCoef, scBased, minDist));
 }
 
 //+------------------------------------------------------------------+
@@ -1034,6 +1037,13 @@ void UpdateDynamicTP()
       double openPrice  = OrderOpenPrice();
       double currentTP  = OrderTakeProfit();
       double newTP      = CalculateAdaptiveTP(openPrice, isBuy);
+
+      // One-way constraint: TP can only move further from price, never closer
+      if(currentTP != 0)
+      {
+         if( isBuy && newTP <= currentTP) continue;
+         if(!isBuy && newTP >= currentTP) continue;
+      }
 
       // Sanity check: TP must be a minimum broker distance from current price
       if(isBuy)
@@ -1329,8 +1339,8 @@ int OnInit()
    Log(StringFormat("V2.0 Profit Target: Factor=%.2f (KAMA-adaptive: ATR * Factor * [1 + ER*Factor/FastPeriod])",
        ProfitTargetFactor));
    Log("V2.0 Dynamic TP: recalculated on each bar close for open positions");
-   Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar) | MinModifyInterval=%ds",
-       (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef, MinModifyIntervalSec));
+   Log(StringFormat("V2.0 Trailing Stop: %s | Activation=%.1f pips (fixed) | Distance=%.2f * SC * ATR (per bar) | Floor=%.1f pips | MinModifyInterval=%ds",
+       (EnableTrailingStop ? "ON" : "OFF"), TrailActivationPips, TrailSCCoef, MinTrailDistPips, MinModifyIntervalSec));
    Log(StringFormat("Lot Mode: %s, FixedLots=%.2f, RiskPct=%.2f",
        (LotMode == LOT_MODE_FIXED ? "Fixed" : "Risk%"), FixedLots, RiskPercent));
    Log(StringFormat("Breakeven: %s, Trigger Factor=%.2f (x ATR)", (EnableBreakeven ? "ON" : "OFF"), BreakevenTriggerFactor));

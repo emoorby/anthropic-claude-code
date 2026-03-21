@@ -43,6 +43,7 @@ input ENUM_TIMEFRAMES ATRCandle_TF   = PERIOD_H1;  // ATR Candle: Signal Timefra
 input int      ATRCandle_ATRPeriod   = 14;          // ATR Candle: ATR Period
 input double   ATRCandle_Multiplier  = 2.0;         // ATR Candle: Candle size minimum (x ATR)
 input double   ATRCandle_ClosePct    = 30.0;        // ATR Candle: Max close distance from extreme (%)
+input double   ATRCandle_MaxSLPips   = 120.0;       // ATR Candle: Max SL size (pips, 0 = disabled)
 input string   _sep_tw               = ""; // ──────── ATR Candle: Trading Time Windows ────────
 input bool     ATRCandle_TW1_Enable  = false;       // Time Window 1: Enable
 input int      ATRCandle_TW1_StartH  = 1;           // Time Window 1: Start Hour   (0-23)
@@ -1139,6 +1140,14 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
    }
 
    double slPips  = slDistance / g_pipSize;
+
+   if(ATRCandle_MaxSLPips > 0 && slPips > ATRCandle_MaxSLPips)
+   {
+      Log(StringFormat("ATR Candle %s rejected: SL %.1f pips exceeds max %.1f pips",
+          isBuy ? "BUY" : "SELL", slPips, ATRCandle_MaxSLPips));
+      return false;
+   }
+
    double lots    = CalculateLotSize(slPips);
    double tpPrice = CalculateAdaptiveTP(entryPrice, isBuy);
 

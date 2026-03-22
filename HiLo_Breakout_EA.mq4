@@ -117,6 +117,9 @@ bool     g_buyWaitingSignal;    // waiting for new Value6 after SL/close
 
 bool     g_breakevenApplied;    // breakeven already moved for current position
 
+bool     g_sellWasPending;      // true while sell stop has not yet triggered
+bool     g_buyWasPending;       // true while buy stop has not yet triggered
+
 double   g_trailDistancePrice;  // adaptive trail distance in price terms (updated per chart bar)
 
 datetime g_lastATRCandleBar;    // last bar time processed by ATR Candle method
@@ -399,6 +402,54 @@ void LogTradeCancelled(int ticket, bool isBuy, string method, string reason)
               + dow[dt.day_of_week]                              + ","
               + GetSession()                                     + ","
               + reason;
+
+   WriteTradeLogRow(row);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write TRIGGERED row when a pending stop order fires   |
+//+------------------------------------------------------------------+
+void LogTradeTriggered(int ticket, bool isBuy, string method)
+{
+   if(!OrderSelect(ticket, SELECT_BY_TICKET)) return;
+
+   double triggerPrice = OrderOpenPrice();
+   double atrPips      = GetATRPips();
+   double erValue      = GetERValue();
+   double spreadPips   = GetSpreadPips();
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
+              + IntegerToString(MagicNumber)                     + ","
+              + IntegerToString(ticket)                          + ","
+              + "TRIGGERED"                                      + ","
+              + (isBuy ? "BUY" : "SELL")                        + ","
+              + method                                           + ","
+              + ","   // signal_time  — already in ENTRY row
+              + ","   // signal_price — already in ENTRY row
+              + DoubleToStr(triggerPrice, Digits)                + ","
+              + ","   // sl_price
+              + ","   // tp_price
+              + ","   // sl_pips
+              + ","   // lots
+              + DoubleToStr(spreadPips, 1)                       + ","
+              + DoubleToStr(atrPips, 1)                          + ","
+              + DoubleToStr(erValue, 4)                          + ","
+              + ","   // candle_size_pips
+              + ","   // timeframe
+              + ","   // slippage_pips
+              + ","   // close_price
+              + ","   // close_time
+              + ","   // close_reason
+              + ","   // profit_pips
+              + ","   // profit_usd
+              + IntegerToString(dt.hour)                         + ","
+              + dow[dt.day_of_week]                              + ","
+              + GetSession()                                     + ",";
+              // rejection_reason empty
 
    WriteTradeLogRow(row);
 }
@@ -856,6 +907,7 @@ int PlaceSellStop(double value5)
                     entryPrice, slPrice, tpPrice,
                     PipsToRisk, lots, GetSpreadPips(),
                     atrPips, erValue, 0.0, "M30", 0.0);
+      g_sellWasPending = true;
    }
    else
    {
@@ -923,6 +975,7 @@ int PlaceBuyStop(double value6)
                     entryPrice, slPrice, tpPrice,
                     PipsToRisk, lots, GetSpreadPips(),
                     atrPips, erValue, 0.0, "M30", 0.0);
+      g_buyWasPending = true;
    }
    else
    {
@@ -1152,7 +1205,12 @@ void MonitorOrderStates()
       // Was it a pending that triggered into a position?
       if(OrderTriggered(g_sellTicket))
       {
-         // Position is open - nothing to do, let it run
+         if(g_sellWasPending)
+         {
+            Log(StringFormat("Sell order #%d TRIGGERED - position now open", g_sellTicket));
+            LogTradeTriggered(g_sellTicket, false, "ZZSemafor");
+            g_sellWasPending = false;
+         }
       }
       else if(!PendingOrderExists(g_sellTicket))
       {
@@ -1174,7 +1232,12 @@ void MonitorOrderStates()
    {
       if(OrderTriggered(g_buyTicket))
       {
-         // Position is open - nothing to do
+         if(g_buyWasPending)
+         {
+            Log(StringFormat("Buy order #%d TRIGGERED - position now open", g_buyTicket));
+            LogTradeTriggered(g_buyTicket, true, "ZZSemafor");
+            g_buyWasPending = false;
+         }
       }
       else if(!PendingOrderExists(g_buyTicket))
       {

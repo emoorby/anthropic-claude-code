@@ -122,6 +122,9 @@ double   g_trailDistancePrice;  // adaptive trail distance in price terms (updat
 datetime g_lastATRCandleBar;    // last bar time processed by ATR Candle method
 datetime g_lastSLModifyTime;    // throttle: last time SL was modified (seconds)
 
+int      g_atrCandleTicket;     // ticket of active ATR candle position (-1 if none)
+bool     g_atrCandleIsBuy;      // direction of active ATR candle position
+
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
 const int BUF_VALUE6 = 5;    // Value 6 - local highs (Buy Stop)
@@ -133,6 +136,271 @@ void Log(string msg)
 {
    if(EnableLogging)
       Print("[HiLo_BRK] ", msg);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Classify server time into trading session             |
+//+------------------------------------------------------------------+
+string GetSession()
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+
+   bool tokyo   = (h >= 0  && h <  9);
+   bool london  = (h >= 8  && h < 17);
+   bool newYork = (h >= 13 && h < 22);
+   bool sydney  = (h >= 22 || h <  7);
+
+   if(london  && newYork) return "London_NY";
+   if(london  && tokyo)   return "London_Tokyo";
+   if(sydney  && tokyo)   return "Sydney_Tokyo";
+   if(london)             return "London";
+   if(newYork)            return "New_York";
+   if(tokyo)              return "Tokyo";
+   if(sydney)             return "Sydney";
+   return "Off";
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write one CSV row to the per-magic log file           |
+//+------------------------------------------------------------------+
+void WriteTradeLogRow(string row)
+{
+   string filename = "HiLo_trades_" + IntegerToString(MagicNumber) + ".csv";
+   string header   = "log_time,magic,ticket,event,direction,method,"
+                   + "signal_time,signal_price,entry_price,sl_price,tp_price,"
+                   + "sl_pips,lots,spread_pips,atr_pips,er_value,candle_size_pips,"
+                   + "timeframe,slippage_pips,close_price,close_time,close_reason,"
+                   + "profit_pips,profit_usd,hour,day_of_week,session,rejection_reason";
+
+   int handle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_TXT | FILE_ANSI);
+   if(handle == INVALID_HANDLE)
+   {
+      handle = FileOpen(filename, FILE_WRITE | FILE_TXT | FILE_ANSI);
+      if(handle == INVALID_HANDLE)
+      {
+         Log("TRADE LOG: Cannot open " + filename + " err=" + IntegerToString(GetLastError()));
+         return;
+      }
+      FileWriteString(handle, header + "\n");
+   }
+   else
+   {
+      FileSeek(handle, 0, SEEK_END);
+   }
+
+   FileWriteString(handle, row + "\n");
+   FileClose(handle);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write ENTRY row on order placement                    |
+//+------------------------------------------------------------------+
+void LogTradeEntry(int ticket,        bool isBuy,        string method,
+                   datetime signalTime, double signalPrice,
+                   double entryPrice, double slPrice,    double tpPrice,
+                   double slPips,     double lots,       double spreadPips,
+                   double atrPips,    double erValue,    double candleSizePips,
+                   string timeframe,  double slippagePips)
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
+              + IntegerToString(MagicNumber)                     + ","
+              + IntegerToString(ticket)                          + ","
+              + "ENTRY"                                          + ","
+              + (isBuy ? "BUY" : "SELL")                        + ","
+              + method                                           + ","
+              + TimeToStr(signalTime, TIME_DATE|TIME_SECONDS)    + ","
+              + DoubleToStr(signalPrice, Digits)                 + ","
+              + DoubleToStr(entryPrice, Digits)                  + ","
+              + DoubleToStr(slPrice, Digits)                     + ","
+              + DoubleToStr(tpPrice, Digits)                     + ","
+              + DoubleToStr(slPips, 1)                           + ","
+              + DoubleToStr(lots, 2)                             + ","
+              + DoubleToStr(spreadPips, 1)                       + ","
+              + DoubleToStr(atrPips, 1)                          + ","
+              + DoubleToStr(erValue, 4)                          + ","
+              + DoubleToStr(candleSizePips, 1)                   + ","
+              + timeframe                                        + ","
+              + DoubleToStr(slippagePips, 1)                     + ","
+              + ","   // close_price
+              + ","   // close_time
+              + ","   // close_reason
+              + ","   // profit_pips
+              + ","   // profit_usd
+              + IntegerToString(dt.hour)                         + ","
+              + dow[dt.day_of_week]                              + ","
+              + GetSession()                                     + ",";
+              // rejection_reason empty — trailing comma creates empty field
+
+   WriteTradeLogRow(row);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write CLOSE row when a position closes               |
+//+------------------------------------------------------------------+
+void LogTradeClose(int ticket, bool isBuy, string method)
+{
+   bool found = false;
+   for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
+   {
+      if(!OrderSelect(i, SELECT_BY_POS, MODE_HISTORY)) continue;
+      if(OrderTicket() != ticket)                       continue;
+      found = true;
+      break;
+   }
+   if(!found) return;
+
+   double   closePrice = OrderClosePrice();
+   datetime closeTime  = OrderCloseTime();
+   double   openPrice  = OrderOpenPrice();
+   double   sl         = OrderStopLoss();
+   double   tp         = OrderTakeProfit();
+   double   profitUsd  = OrderProfit() + OrderSwap() + OrderCommission();
+   double   profitPips = isBuy ? (closePrice - openPrice) / g_pipSize
+                                : (openPrice  - closePrice) / g_pipSize;
+
+   string closeReason = "MANUAL";
+   if(sl != 0 && MathAbs(closePrice - sl) <= 2.0 * g_pipSize) closeReason = "SL";
+   if(tp != 0 && MathAbs(closePrice - tp) <= 2.0 * g_pipSize) closeReason = "TP";
+
+   MqlDateTime dt;
+   TimeToStruct(closeTime, dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   bool tk = (dt.hour >= 0  && dt.hour <  9);
+   bool ld = (dt.hour >= 8  && dt.hour < 17);
+   bool ny = (dt.hour >= 13 && dt.hour < 22);
+   bool sy = (dt.hour >= 22 || dt.hour <  7);
+   string session;
+   if(ld && ny)      session = "London_NY";
+   else if(ld && tk) session = "London_Tokyo";
+   else if(sy && tk) session = "Sydney_Tokyo";
+   else if(ld)       session = "London";
+   else if(ny)       session = "New_York";
+   else if(tk)       session = "Tokyo";
+   else if(sy)       session = "Sydney";
+   else              session = "Off";
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS)  + ","
+              + IntegerToString(MagicNumber)                       + ","
+              + IntegerToString(ticket)                            + ","
+              + "CLOSE"                                            + ","
+              + (isBuy ? "BUY" : "SELL")                          + ","
+              + method                                             + ","
+              + ","   // signal_time
+              + ","   // signal_price
+              + ","   // entry_price
+              + ","   // sl_price
+              + ","   // tp_price
+              + ","   // sl_pips
+              + ","   // lots
+              + ","   // spread_pips
+              + ","   // atr_pips
+              + ","   // er_value
+              + ","   // candle_size_pips
+              + ","   // timeframe
+              + ","   // slippage_pips
+              + DoubleToStr(closePrice, Digits)                    + ","
+              + TimeToStr(closeTime, TIME_DATE|TIME_SECONDS)       + ","
+              + closeReason                                        + ","
+              + DoubleToStr(profitPips, 1)                         + ","
+              + DoubleToStr(profitUsd, 2)                          + ","
+              + IntegerToString(dt.hour)                           + ","
+              + dow[dt.day_of_week]                                + ","
+              + session                                            + ",";
+              // rejection_reason empty
+
+   WriteTradeLogRow(row);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write REJECTED row when a signal is filtered out      |
+//+------------------------------------------------------------------+
+void LogTradeRejected(bool isBuy,          string method,  string reason,
+                      datetime signalTime,  double signalPrice,
+                      double slPips,        double atrPips, double erValue,
+                      double candleSizePips, string timeframe)
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
+              + IntegerToString(MagicNumber)                     + ","
+              + ","   // ticket (no order placed)
+              + "REJECTED"                                       + ","
+              + (isBuy ? "BUY" : "SELL")                        + ","
+              + method                                           + ","
+              + TimeToStr(signalTime, TIME_DATE|TIME_SECONDS)    + ","
+              + DoubleToStr(signalPrice, Digits)                 + ","
+              + ","   // entry_price
+              + ","   // sl_price
+              + ","   // tp_price
+              + DoubleToStr(slPips, 1)                           + ","
+              + ","   // lots
+              + ","   // spread_pips
+              + DoubleToStr(atrPips, 1)                          + ","
+              + DoubleToStr(erValue, 4)                          + ","
+              + DoubleToStr(candleSizePips, 1)                   + ","
+              + timeframe                                        + ","
+              + ","   // slippage_pips
+              + ","   // close_price
+              + ","   // close_time
+              + ","   // close_reason
+              + ","   // profit_pips
+              + ","   // profit_usd
+              + IntegerToString(dt.hour)                         + ","
+              + dow[dt.day_of_week]                              + ","
+              + GetSession()                                     + ","
+              + reason;
+
+   WriteTradeLogRow(row);
+}
+
+//+------------------------------------------------------------------+
+//| Trade Log: Write CANCELLED row when a pending order is deleted   |
+//+------------------------------------------------------------------+
+void LogTradeCancelled(int ticket, bool isBuy, string method, string reason)
+{
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
+              + IntegerToString(MagicNumber)                     + ","
+              + IntegerToString(ticket)                          + ","
+              + "CANCELLED"                                      + ","
+              + (isBuy ? "BUY" : "SELL")                        + ","
+              + method                                           + ","
+              + ","   // signal_time
+              + ","   // signal_price
+              + ","   // entry_price
+              + ","   // sl_price
+              + ","   // tp_price
+              + ","   // sl_pips
+              + ","   // lots
+              + ","   // spread_pips
+              + ","   // atr_pips
+              + ","   // er_value
+              + ","   // candle_size_pips
+              + ","   // timeframe
+              + ","   // slippage_pips
+              + ","   // close_price
+              + ","   // close_time
+              + ","   // close_reason
+              + ","   // profit_pips
+              + ","   // profit_usd
+              + IntegerToString(dt.hour)                         + ","
+              + dow[dt.day_of_week]                              + ","
+              + GetSession()                                     + ","
+              + reason;
+
+   WriteTradeLogRow(row);
 }
 
 //+------------------------------------------------------------------+
@@ -536,12 +804,27 @@ bool DeletePendingOrder(int ticket)
 //+------------------------------------------------------------------+
 int PlaceSellStop(double value5)
 {
+   double atrPips = GetATRPips();
+   double erValue = GetERValue();
+
    if(!CheckSpreadFilter())
+   {
+      LogTradeRejected(false, "ZZSemafor", "SPREAD", TimeCurrent(), value5,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
    if(!CheckATRFilter())
+   {
+      LogTradeRejected(false, "ZZSemafor", "ATR_FILTER", TimeCurrent(), value5,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
    if(!CheckERFilter())
+   {
+      LogTradeRejected(false, "ZZSemafor", "ER_LAYER1", TimeCurrent(), value5,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
 
    double entryPrice = NormalizeDouble(value5 - g_halfRisk, Digits);
    double slPrice    = NormalizeDouble(value5 + g_halfRisk, Digits);
@@ -556,6 +839,8 @@ int PlaceSellStop(double value5)
    {
       Log(StringFormat("REJECTED: Sell Stop too close to market. Entry=%.5f, Bid=%.5f, MinDist=%.5f",
           entryPrice, Bid, stopLevel));
+      LogTradeRejected(false, "ZZSemafor", "TOO_CLOSE", TimeCurrent(), value5,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
    }
 
@@ -566,6 +851,11 @@ int PlaceSellStop(double value5)
    {
       Log(StringFormat("SELL STOP placed #%d: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, Value5=%.5f",
           ticket, entryPrice, slPrice, tpPrice, lots, value5));
+      LogTradeEntry(ticket, false, "ZZSemafor",
+                    TimeCurrent(), value5,
+                    entryPrice, slPrice, tpPrice,
+                    PipsToRisk, lots, GetSpreadPips(),
+                    atrPips, erValue, 0.0, "M30", 0.0);
    }
    else
    {
@@ -581,12 +871,27 @@ int PlaceSellStop(double value5)
 //+------------------------------------------------------------------+
 int PlaceBuyStop(double value6)
 {
+   double atrPips = GetATRPips();
+   double erValue = GetERValue();
+
    if(!CheckSpreadFilter())
+   {
+      LogTradeRejected(true, "ZZSemafor", "SPREAD", TimeCurrent(), value6,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
    if(!CheckATRFilter())
+   {
+      LogTradeRejected(true, "ZZSemafor", "ATR_FILTER", TimeCurrent(), value6,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
    if(!CheckERFilter())
+   {
+      LogTradeRejected(true, "ZZSemafor", "ER_LAYER1", TimeCurrent(), value6,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
+   }
 
    double entryPrice = NormalizeDouble(value6 + g_halfRisk, Digits);
    double slPrice    = NormalizeDouble(value6 - g_halfRisk, Digits);
@@ -601,6 +906,8 @@ int PlaceBuyStop(double value6)
    {
       Log(StringFormat("REJECTED: Buy Stop too close to market. Entry=%.5f, Ask=%.5f, MinDist=%.5f",
           entryPrice, Ask, stopLevel));
+      LogTradeRejected(true, "ZZSemafor", "TOO_CLOSE", TimeCurrent(), value6,
+                       PipsToRisk, atrPips, erValue, 0.0, "M30");
       return -1;
    }
 
@@ -611,6 +918,11 @@ int PlaceBuyStop(double value6)
    {
       Log(StringFormat("BUY STOP placed #%d: Entry=%.5f, SL=%.5f, TP=%.5f, Lots=%.2f, Value6=%.5f",
           ticket, entryPrice, slPrice, tpPrice, lots, value6));
+      LogTradeEntry(ticket, true, "ZZSemafor",
+                    TimeCurrent(), value6,
+                    entryPrice, slPrice, tpPrice,
+                    PipsToRisk, lots, GetSpreadPips(),
+                    atrPips, erValue, 0.0, "M30", 0.0);
    }
    else
    {
@@ -848,6 +1160,7 @@ void MonitorOrderStates()
          if(OrderWasClosed(g_sellTicket))
          {
             Log(StringFormat("Sell order #%d was CLOSED (SL hit or manual close)", g_sellTicket));
+            LogTradeClose(g_sellTicket, false, "ZZSemafor");
             g_sellTicket = -1;
             g_sellWaitingSignal = true;
             g_breakevenApplied = false;
@@ -868,6 +1181,7 @@ void MonitorOrderStates()
          if(OrderWasClosed(g_buyTicket))
          {
             Log(StringFormat("Buy order #%d was CLOSED (SL hit or manual close)", g_buyTicket));
+            LogTradeClose(g_buyTicket, true, "ZZSemafor");
             g_buyTicket = -1;
             g_buyWaitingSignal = true;
             g_breakevenApplied = false;
@@ -1123,10 +1437,20 @@ void DeleteAllATRCandleObjects()
 //| ATR Candle: Place market order with SL at opposite candle end     |
 //+------------------------------------------------------------------+
 bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
-                               datetime barTime, double atrValue, double candleSize)
+                               datetime barTime, double atrValue, double candleSize,
+                               double candleClose)
 {
+   double atrPips = atrValue / g_pipSize;
+   double erValue = GetERValue();
+   double candleSizePips = candleSize / g_pipSize;
+   string tfStr   = EnumToString(ATRCandle_TF);
+
    if(!CheckSpreadFilter())
+   {
+      LogTradeRejected(isBuy, "ATRCandle", "SPREAD", barTime, candleClose,
+                       candleSizePips, atrPips, erValue, candleSizePips, tfStr);
       return false;
+   }
 
    double entryPrice = isBuy ? Ask : Bid;
    double stopLevel  = MarketInfo(Symbol(), MODE_STOPLEVEL) * Point;
@@ -1136,6 +1460,8 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
    {
       Log(StringFormat("ATR Candle %s rejected: SL too close. Dist=%.5f, Min=%.5f",
           isBuy ? "BUY" : "SELL", slDistance, stopLevel));
+      LogTradeRejected(isBuy, "ATRCandle", "TOO_CLOSE", barTime, candleClose,
+                       slDistance / g_pipSize, atrPips, erValue, candleSizePips, tfStr);
       return false;
    }
 
@@ -1145,6 +1471,8 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
    {
       Log(StringFormat("ATR Candle %s rejected: SL %.1f pips exceeds max %.1f pips",
           isBuy ? "BUY" : "SELL", slPips, ATRCandle_MaxSLPips));
+      LogTradeRejected(isBuy, "ATRCandle", "MAX_SL_PIPS", barTime, candleClose,
+                       slPips, atrPips, erValue, candleSizePips, tfStr);
       return false;
    }
 
@@ -1161,12 +1489,48 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
           isBuy ? "BUY" : "SELL", ticket, entryPrice, slPrice, tpPrice, lots,
           atrValue, candleSize));
       DrawATRCandleLabel(barTime, candleHigh, atrValue, candleSize, isBuy);
+
+      double slippagePips = isBuy ? (entryPrice - candleClose) / g_pipSize
+                                  : (candleClose - entryPrice) / g_pipSize;
+      LogTradeEntry(ticket, isBuy, "ATRCandle",
+                    barTime, candleClose,
+                    entryPrice, slPrice, tpPrice,
+                    slPips, lots, GetSpreadPips(),
+                    atrPips, erValue, candleSizePips, tfStr, slippagePips);
+
+      g_atrCandleTicket = ticket;
+      g_atrCandleIsBuy  = isBuy;
       return true;
    }
 
    Log(StringFormat("ATR Candle %s FAILED: Entry=%.5f, SL=%.5f, TP=%.5f, Error=%d",
        isBuy ? "BUY" : "SELL", entryPrice, slPrice, tpPrice, GetLastError()));
    return false;
+}
+
+//+------------------------------------------------------------------+
+//| ATR Candle: Monitor active position for close and log it         |
+//+------------------------------------------------------------------+
+void MonitorATRCandlePosition()
+{
+   if(g_atrCandleTicket <= 0)
+      return;
+
+   // Still open in active orders — nothing to do
+   for(int i = OrdersTotal() - 1; i >= 0; i--)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+         if(OrderTicket() == g_atrCandleTicket)
+            return;
+   }
+
+   // No longer active — check history for close
+   if(OrderWasClosed(g_atrCandleTicket))
+   {
+      Log(StringFormat("ATR Candle position #%d CLOSED", g_atrCandleTicket));
+      LogTradeClose(g_atrCandleTicket, g_atrCandleIsBuy, "ATRCandle");
+      g_atrCandleTicket = -1;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -1285,7 +1649,7 @@ void MonitorATRCandleSignals()
 
       Log(StringFormat("ATR Candle BUY signal: Range=%.5f, ATR=%.5f (x%.2f), ClosePct=%.1f%%",
           candleRange, atrValue, candleRange / atrValue, distPct));
-      PlaceATRCandleMarketOrder(true, candleLow, candleHigh, barTime, atrValue, candleRange);
+      PlaceATRCandleMarketOrder(true, candleLow, candleHigh, barTime, atrValue, candleRange, candleClose);
    }
    else if(isBear)
    {
@@ -1300,7 +1664,7 @@ void MonitorATRCandleSignals()
 
       Log(StringFormat("ATR Candle SELL signal: Range=%.5f, ATR=%.5f (x%.2f), ClosePct=%.1f%%",
           candleRange, atrValue, candleRange / atrValue, distPct));
-      PlaceATRCandleMarketOrder(false, candleHigh, candleHigh, barTime, atrValue, candleRange);
+      PlaceATRCandleMarketOrder(false, candleHigh, candleHigh, barTime, atrValue, candleRange, candleClose);
    }
 }
 
@@ -1375,6 +1739,8 @@ int OnInit()
    g_trailDistancePrice  = 0.0;
    g_lastATRCandleBar    = iTime(Symbol(), ATRCandle_TF, 0);
    g_lastSLModifyTime    = 0;
+   g_atrCandleTicket     = -1;
+   g_atrCandleIsBuy      = false;
 
    // Compute initial adaptive trail distance
    RecalculateTrailDistance();
@@ -1442,12 +1808,14 @@ void OnTick()
          if(g_sellTicket > 0 && PendingOrderExists(g_sellTicket))
          {
             Log(StringFormat("ER Layer 2: ER=%.4f < Min=%.4f - deleting sell stop #%d", erValue, ER_Layer2_MinValue, g_sellTicket));
+            LogTradeCancelled(g_sellTicket, false, "ZZSemafor", "ER_LAYER2");
             if(DeletePendingOrder(g_sellTicket))
                g_sellTicket = 0;
          }
          if(g_buyTicket > 0 && PendingOrderExists(g_buyTicket))
          {
             Log(StringFormat("ER Layer 2: ER=%.4f < Min=%.4f - deleting buy stop #%d", erValue, ER_Layer2_MinValue, g_buyTicket));
+            LogTradeCancelled(g_buyTicket, true, "ZZSemafor", "ER_LAYER2");
             if(DeletePendingOrder(g_buyTicket))
                g_buyTicket = 0;
          }
@@ -1478,8 +1846,11 @@ void OnTick()
       }
    }
 
-   // ATR Candle method: check signal timeframe for breakout signals
+   // ATR Candle method: check signal timeframe for breakout signals and monitor position
    if(UseATRCandleMethod)
+   {
       MonitorATRCandleSignals();
+      MonitorATRCandlePosition();
+   }
 }
 //+------------------------------------------------------------------+

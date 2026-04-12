@@ -322,6 +322,50 @@ void LogTradeClose(int ticket, bool isBuy, string method)
 }
 
 //+------------------------------------------------------------------+
+//| Trade Log: Write CANCELLED row for a pending order deleted       |
+//| before it ever triggered (profit = 0).                           |
+//+------------------------------------------------------------------+
+void LogTradeCancelled(int ticket, bool isBuy, string method)
+{
+   if(!OrderSelect(ticket, SELECT_BY_TICKET)) return;
+
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   string dow[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+
+   string row = TimeToStr(TimeCurrent(), TIME_DATE|TIME_SECONDS) + ","
+              + IntegerToString(MagicNumber)                     + ","
+              + IntegerToString(ticket)                          + ","
+              + "CANCELLED"                                      + ","
+              + (isBuy ? "BUY" : "SELL")                        + ","
+              + method                                           + ","
+              + ","   // signal_time
+              + ","   // signal_price
+              + ","   // entry_price
+              + ","   // sl_price
+              + ","   // tp_price
+              + ","   // sl_pips
+              + ","   // lots
+              + ","   // spread_pips
+              + ","   // atr_pips
+              + ","   // er_value
+              + ","   // candle_size_pips
+              + ","   // timeframe
+              + ","   // slippage_pips
+              + ","   // close_price
+              + ","   // close_time
+              + ","   // close_reason
+              + "0,"  // profit_pips
+              + "0,"  // profit_usd
+              + IntegerToString(dt.hour)                         + ","
+              + dow[dt.day_of_week]                              + ","
+              + GetSession()                                     + ",";
+              // rejection_reason empty
+
+   WriteTradeLogRow(row);
+}
+
+//+------------------------------------------------------------------+
 //| Trade Log: Write REJECTED row when a signal is filtered out      |
 //+------------------------------------------------------------------+
 void LogTradeRejected(bool isBuy,          string method,  string reason,
@@ -1217,11 +1261,22 @@ void MonitorOrderStates()
          // Ticket no longer exists as pending or open - check history
          if(OrderWasClosed(g_sellTicket))
          {
-            Log(StringFormat("Sell order #%d was CLOSED (SL hit or manual close)", g_sellTicket));
-            LogTradeClose(g_sellTicket, false, "ZZSemafor");
+            if(g_sellWasPending)
+            {
+               // Order was deleted before it ever triggered - not a real trade
+               Log(StringFormat("Sell stop #%d CANCELLED (deleted before triggering)", g_sellTicket));
+               LogTradeCancelled(g_sellTicket, false, "ZZSemafor");
+            }
+            else
+            {
+               // Order triggered and was later closed (SL/TP/manual)
+               Log(StringFormat("Sell order #%d was CLOSED (SL hit or manual close)", g_sellTicket));
+               LogTradeClose(g_sellTicket, false, "ZZSemafor");
+            }
             g_sellTicket = -1;
             g_sellWaitingSignal = true;
             g_breakevenApplied = false;
+            g_sellWasPending = false;
             Log("Sell side now WAITING for new Value5 signal before re-entry");
          }
       }
@@ -1243,11 +1298,22 @@ void MonitorOrderStates()
       {
          if(OrderWasClosed(g_buyTicket))
          {
-            Log(StringFormat("Buy order #%d was CLOSED (SL hit or manual close)", g_buyTicket));
-            LogTradeClose(g_buyTicket, true, "ZZSemafor");
+            if(g_buyWasPending)
+            {
+               // Order was deleted before it ever triggered - not a real trade
+               Log(StringFormat("Buy stop #%d CANCELLED (deleted before triggering)", g_buyTicket));
+               LogTradeCancelled(g_buyTicket, true, "ZZSemafor");
+            }
+            else
+            {
+               // Order triggered and was later closed (SL/TP/manual)
+               Log(StringFormat("Buy order #%d was CLOSED (SL hit or manual close)", g_buyTicket));
+               LogTradeClose(g_buyTicket, true, "ZZSemafor");
+            }
             g_buyTicket = -1;
             g_buyWaitingSignal = true;
             g_breakevenApplied = false;
+            g_buyWasPending = false;
             Log("Buy side now WAITING for new Value6 signal before re-entry");
          }
       }

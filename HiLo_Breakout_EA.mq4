@@ -43,32 +43,33 @@ input ENUM_TIMEFRAMES ATRCandle_TF   = PERIOD_H1;  // ATR Candle: Signal Timefra
 input int      ATRCandle_ATRPeriod   = 14;          // ATR Candle: ATR Period
 input double   ATRCandle_Multiplier  = 2.0;         // ATR Candle: Candle size minimum (x ATR)
 input double   ATRCandle_ClosePct    = 30.0;        // ATR Candle: Max close distance from extreme (%)
-input double   ATRCandle_MaxSLPips   = 120.0;       // ATR Candle: Max SL size (pips, 0 = disabled)
+input double   ATRCandle_MinSLPips   = 65.0;        // ATR Candle: Min SL size (pips, 0 = disabled)
+input double   ATRCandle_MaxSLPips   = 90.0;        // ATR Candle: Max SL size (pips, 0 = disabled)
 input string   _sep_tw               = ""; // ──────── ATR Candle: Trading Time Windows ────────
-input bool     ATRCandle_TW1_Enable  = false;       // Time Window 1: Enable
-input int      ATRCandle_TW1_StartH  = 1;           // Time Window 1: Start Hour   (0-23)
+input bool     ATRCandle_TW1_Enable  = true;        // Time Window 1: Enable
+input int      ATRCandle_TW1_StartH  = 0;           // Time Window 1: Start Hour   (0-23)
 input int      ATRCandle_TW1_StartM  = 0;           // Time Window 1: Start Minute (0-59)
-input int      ATRCandle_TW1_StopH   = 4;           // Time Window 1: Stop Hour    (0-23)
+input int      ATRCandle_TW1_StopH   = 0;           // Time Window 1: Stop Hour    (0-23)
 input int      ATRCandle_TW1_StopM   = 59;          // Time Window 1: Stop Minute  (0-59)
-input bool     ATRCandle_TW2_Enable  = false;       // Time Window 2: Enable
-input int      ATRCandle_TW2_StartH  = 7;           // Time Window 2: Start Hour   (0-23)
+input bool     ATRCandle_TW2_Enable  = true;        // Time Window 2: Enable
+input int      ATRCandle_TW2_StartH  = 2;           // Time Window 2: Start Hour   (0-23)
 input int      ATRCandle_TW2_StartM  = 0;           // Time Window 2: Start Minute (0-59)
-input int      ATRCandle_TW2_StopH   = 11;          // Time Window 2: Stop Hour    (0-23)
+input int      ATRCandle_TW2_StopH   = 6;           // Time Window 2: Stop Hour    (0-23)
 input int      ATRCandle_TW2_StopM   = 59;          // Time Window 2: Stop Minute  (0-59)
-input bool     ATRCandle_TW3_Enable  = false;       // Time Window 3: Enable
-input int      ATRCandle_TW3_StartH  = 13;          // Time Window 3: Start Hour   (0-23)
+input bool     ATRCandle_TW3_Enable  = true;        // Time Window 3: Enable
+input int      ATRCandle_TW3_StartH  = 8;           // Time Window 3: Start Hour   (0-23)
 input int      ATRCandle_TW3_StartM  = 0;           // Time Window 3: Start Minute (0-59)
-input int      ATRCandle_TW3_StopH   = 17;          // Time Window 3: Stop Hour    (0-23)
+input int      ATRCandle_TW3_StopH   = 8;           // Time Window 3: Stop Hour    (0-23)
 input int      ATRCandle_TW3_StopM   = 59;          // Time Window 3: Stop Minute  (0-59)
-input bool     ATRCandle_TW4_Enable  = false;       // Time Window 4: Enable
-input int      ATRCandle_TW4_StartH  = 19;          // Time Window 4: Start Hour   (0-23)
+input bool     ATRCandle_TW4_Enable  = true;        // Time Window 4: Enable
+input int      ATRCandle_TW4_StartH  = 13;          // Time Window 4: Start Hour   (0-23)
 input int      ATRCandle_TW4_StartM  = 0;           // Time Window 4: Start Minute (0-59)
-input int      ATRCandle_TW4_StopH   = 22;          // Time Window 4: Stop Hour    (0-23)
+input int      ATRCandle_TW4_StopH   = 16;          // Time Window 4: Stop Hour    (0-23)
 input int      ATRCandle_TW4_StopM   = 59;          // Time Window 4: Stop Minute  (0-59)
-input bool     ATRCandle_TW5_Enable  = false;       // Time Window 5: Enable
-input int      ATRCandle_TW5_StartH  = 0;           // Time Window 5: Start Hour   (0-23)
+input bool     ATRCandle_TW5_Enable  = true;        // Time Window 5: Enable
+input int      ATRCandle_TW5_StartH  = 19;          // Time Window 5: Start Hour   (0-23)
 input int      ATRCandle_TW5_StartM  = 0;           // Time Window 5: Start Minute (0-59)
-input int      ATRCandle_TW5_StopH   = 23;          // Time Window 5: Stop Hour    (0-23)
+input int      ATRCandle_TW5_StopH   = 21;          // Time Window 5: Stop Hour    (0-23)
 input int      ATRCandle_TW5_StopM   = 59;          // Time Window 5: Stop Minute  (0-59)
 
 input string   _sep_filters          = ""; // ══════════════ FILTERS ═════════════════
@@ -1595,6 +1596,15 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
    }
 
    double slPips  = slDistance / g_pipSize;
+
+   if(ATRCandle_MinSLPips > 0 && slPips < ATRCandle_MinSLPips)
+   {
+      Log(StringFormat("ATR Candle %s rejected: SL %.1f pips below min %.1f pips",
+          isBuy ? "BUY" : "SELL", slPips, ATRCandle_MinSLPips));
+      LogTradeRejected(isBuy, "ATRCandle", "MIN_SL_PIPS", barTime, candleClose,
+                       slPips, atrPips, erValue, candleSizePips, tfStr);
+      return false;
+   }
 
    if(ATRCandle_MaxSLPips > 0 && slPips > ATRCandle_MaxSLPips)
    {

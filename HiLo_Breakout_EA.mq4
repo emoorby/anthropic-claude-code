@@ -71,6 +71,9 @@ input int      ATRCandle_TW5_StartH  = 19;          // Time Window 5: Start Hour
 input int      ATRCandle_TW5_StartM  = 0;           // Time Window 5: Start Minute (0-59)
 input int      ATRCandle_TW5_StopH   = 21;          // Time Window 5: Stop Hour    (0-23)
 input int      ATRCandle_TW5_StopM   = 59;          // Time Window 5: Stop Minute  (0-59)
+input string   _sep_maxdur           = ""; // ──────── ATR Candle: Max Trade Duration ────────
+input bool     EnableATRCandle_MaxDur = true;        // ATR Candle: Enable max trade duration
+input int      ATRCandle_MaxDurMin   = 12;           // ATR Candle: Max open duration (minutes)
 
 input string   _sep_filters          = ""; // ══════════════ FILTERS ═════════════════
 input double   MaxSpreadPips         = 5.0;         // Max Spread (pips)
@@ -128,6 +131,7 @@ datetime g_lastSLModifyTime;    // throttle: last time SL was modified (seconds)
 
 int      g_atrCandleTicket;     // ticket of active ATR candle position (-1 if none)
 bool     g_atrCandleIsBuy;      // direction of active ATR candle position
+datetime g_atrCandleOpenTime;   // server time when active ATR candle position was opened
 
 // Buffer indices for iCustom
 const int BUF_VALUE5 = 4;    // Value 5 - local lows  (Sell Stop)
@@ -247,7 +251,7 @@ void LogTradeEntry(int ticket,        bool isBuy,        string method,
 //+------------------------------------------------------------------+
 //| Trade Log: Write CLOSE row when a position closes               |
 //+------------------------------------------------------------------+
-void LogTradeClose(int ticket, bool isBuy, string method)
+void LogTradeClose(int ticket, bool isBuy, string method, string closeReasonOverride = "")
 {
    bool found = false;
    for(int i = OrdersHistoryTotal() - 1; i >= 0; i--)
@@ -268,9 +272,15 @@ void LogTradeClose(int ticket, bool isBuy, string method)
    double   profitPips = isBuy ? (closePrice - openPrice) / g_pipSize
                                 : (openPrice  - closePrice) / g_pipSize;
 
-   string closeReason = "MANUAL";
-   if(sl != 0 && MathAbs(closePrice - sl) <= 2.0 * g_pipSize) closeReason = "SL";
-   if(tp != 0 && MathAbs(closePrice - tp) <= 2.0 * g_pipSize) closeReason = "TP";
+   string closeReason;
+   if(closeReasonOverride != "")
+      closeReason = closeReasonOverride;
+   else
+   {
+      closeReason = "MANUAL";
+      if(sl != 0 && MathAbs(closePrice - sl) <= 2.0 * g_pipSize) closeReason = "SL";
+      if(tp != 0 && MathAbs(closePrice - tp) <= 2.0 * g_pipSize) closeReason = "TP";
+   }
 
    MqlDateTime dt;
    TimeToStruct(closeTime, dt);
@@ -1637,8 +1647,9 @@ bool PlaceATRCandleMarketOrder(bool isBuy, double slPrice, double candleHigh,
                     slPips, lots, GetSpreadPips(),
                     atrPips, erValue, candleSizePips, tfStr, slippagePips);
 
-      g_atrCandleTicket = ticket;
-      g_atrCandleIsBuy  = isBuy;
+      g_atrCandleTicket   = ticket;
+      g_atrCandleIsBuy    = isBuy;
+      g_atrCandleOpenTime = TimeCurrent();
       return true;
    }
 
@@ -1655,12 +1666,44 @@ void MonitorATRCandlePosition()
    if(g_atrCandleTicket <= 0)
       return;
 
-   // Still open in active orders — nothing to do
+   // Check if still open in active orders
+   bool stillOpen = false;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
    {
       if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
          if(OrderTicket() == g_atrCandleTicket)
-            return;
+         {
+            stillOpen = true;
+            break;
+         }
+   }
+
+   if(stillOpen)
+   {
+      // Max duration check: force-close if position has been open too long
+      if(EnableATRCandle_MaxDur && ATRCandle_MaxDurMin > 0 && g_atrCandleOpenTime > 0)
+      {
+         int elapsedMin = (int)((TimeCurrent() - g_atrCandleOpenTime) / 60);
+         if(elapsedMin >= ATRCandle_MaxDurMin)
+         {
+            if(OrderSelect(g_atrCandleTicket, SELECT_BY_TICKET))
+            {
+               double closePrice = g_atrCandleIsBuy ? Bid : Ask;
+               Log(StringFormat("ATR Candle #%d TIMEOUT after %d min — closing at market",
+                   g_atrCandleTicket, elapsedMin));
+               if(OrderClose(g_atrCandleTicket, OrderLots(), closePrice, 3, clrOrange))
+               {
+                  LogTradeClose(g_atrCandleTicket, g_atrCandleIsBuy, "ATRCandle", "TIMEOUT");
+                  g_atrCandleTicket   = -1;
+                  g_atrCandleOpenTime = 0;
+               }
+               else
+                  Log(StringFormat("ATR Candle #%d timeout close FAILED, error=%d",
+                      g_atrCandleTicket, GetLastError()));
+            }
+         }
+      }
+      return;
    }
 
    // No longer active — check history for close
@@ -1668,7 +1711,8 @@ void MonitorATRCandlePosition()
    {
       Log(StringFormat("ATR Candle position #%d CLOSED", g_atrCandleTicket));
       LogTradeClose(g_atrCandleTicket, g_atrCandleIsBuy, "ATRCandle");
-      g_atrCandleTicket = -1;
+      g_atrCandleTicket   = -1;
+      g_atrCandleOpenTime = 0;
    }
 }
 
@@ -1880,6 +1924,7 @@ int OnInit()
    g_lastSLModifyTime    = 0;
    g_atrCandleTicket     = -1;
    g_atrCandleIsBuy      = false;
+   g_atrCandleOpenTime   = 0;
 
    // Compute initial adaptive trail distance
    RecalculateTrailDistance();

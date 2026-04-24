@@ -3,7 +3,7 @@
 //|                                                            2026   |
 //+------------------------------------------------------------------+
 #property copyright   "2026"
-#property version     "1.00"
+#property version     "1.01"
 #property description "XAUUSD H1 Gold Scalper — breakout pending orders"
 
 #include <Trade\Trade.mqh>
@@ -89,6 +89,7 @@ input double          InpDailyMaxProfit  = 9.6;                // Daily Max Prof
 input int             InpMagicNumber     = 121212121;          // Magic Number
 input string          InpTradeComment    = "GoldScalper";      // Trade Comment
 input bool            InpDisplayInfo     = true;               // Display Info Panel
+input bool            InpEnableLogging   = true;               // Enable Logging
 
 //+------------------------------------------------------------------+
 //| Globals                                                           |
@@ -104,7 +105,20 @@ int      g_ma30Handle        = INVALID_HANDLE;
 int      g_ma50Handle        = INVALID_HANDLE;
 int      g_ma100Handle       = INVALID_HANDLE;
 
-ulong    g_splitTickets[];   // tickets that have had partial close applied
+// Session times parsed once at init (minutes since midnight)
+int      g_sessionStartMins  = 0;
+int      g_sessionEndMins    = 0;
+int      g_fridayEndMins     = 0;
+
+ulong    g_splitTickets[];
+
+//+------------------------------------------------------------------+
+//| Logging helper                                                    |
+//+------------------------------------------------------------------+
+void Log(const string msg)
+  {
+   if(InpEnableLogging) Print(msg);
+  }
 
 //+------------------------------------------------------------------+
 //| Initialisation                                                    |
@@ -113,8 +127,20 @@ int OnInit()
   {
    g_trade.SetExpertMagicNumber(InpMagicNumber);
    g_trade.SetDeviationInPoints(3);
-   g_trade.SetTypeFilling(ORDER_FILLING_FOK);
-   g_trade.LogLevel(LOG_LEVEL_ERRORS);
+   g_trade.LogLevel(InpEnableLogging ? LOG_LEVEL_ALL : LOG_LEVEL_ERRORS);
+
+   // Auto-detect the filling mode the broker supports for this symbol.
+   // Hardcoding FOK can silently cause every order to be rejected if the
+   // broker requires IOC or RETURN instead.
+   int fillFlags = (int)SymbolInfoInteger(_Symbol, SYMBOL_FILLING_MODE);
+   ENUM_ORDER_TYPE_FILLING fill;
+   if((fillFlags & SYMBOL_FILLING_FOK) != 0)
+      fill = ORDER_FILLING_FOK;
+   else if((fillFlags & SYMBOL_FILLING_IOC) != 0)
+      fill = ORDER_FILLING_IOC;
+   else
+      fill = ORDER_FILLING_RETURN;
+   g_trade.SetTypeFilling(fill);
 
    int atrPeriod = (int)MathMax(1, MathRound(InpATRPeriod));
    g_atrHandle = iATR(_Symbol, _Period, atrPeriod);
@@ -137,7 +163,20 @@ int OnInit()
    g_dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
    g_dailyResetDate    = TimeCurrent();
 
+   // Parse session time strings once rather than on every tick
+   int h, m;
+   ParseTime(InpSessionStart, h, m); g_sessionStartMins = h * 60 + m;
+   ParseTime(InpSessionEnd,   h, m); g_sessionEndMins   = h * 60 + m;
+   ParseTime(InpFridayEnd,    h, m); g_fridayEndMins    = h * 60 + m;
+
    ArrayResize(g_splitTickets, 0);
+
+   Log(StringFormat("GoldScalper v1.01 init | magic=%d | session=%s-%s (Fri:%s) | "
+                    "filter=%s | filling=%s | ATR period=%d | balance=%.2f",
+       InpMagicNumber, InpSessionStart, InpSessionEnd, InpFridayEnd,
+       EnumToString(InpTradeFilter), EnumToString(fill), atrPeriod,
+       g_dailyStartBalance));
+
    return INIT_SUCCEEDED;
   }
 
@@ -151,8 +190,9 @@ void OnDeinit(const int reason)
    if(g_ma30Handle  != INVALID_HANDLE) IndicatorRelease(g_ma30Handle);
    if(g_ma50Handle  != INVALID_HANDLE) IndicatorRelease(g_ma50Handle);
    if(g_ma100Handle != INVALID_HANDLE) IndicatorRelease(g_ma100Handle);
-   DeleteAllPendingOrders();
+   DeleteAllPendingOrders("EA deactivated");
    Comment("");
+   Log(StringFormat("GoldScalper deactivated, reason code=%d", reason));
   }
 
 //+------------------------------------------------------------------+
@@ -164,34 +204,61 @@ void OnTick()
    CleanSplitTickets();
    ManagePositions();
 
-   // If a position is open, cancel any remaining pending order for this EA
-   if(CountPositions() > 0)
+   // Cache these once — both are used multiple times below
+   int    posCount = CountPositions();
+   double spread   = GetSpreadPoints();
+
+   // Position is open: cancel any remaining pending order and wait
+   if(posCount > 0)
      {
-      DeleteAllPendingOrders();
-      if(InpDisplayInfo) UpdateDisplay();
+      // Only call the delete loop when there is actually something to delete
+      if(OrdersTotal() > 0)
+         DeleteAllPendingOrders("position open");
+      if(InpDisplayInfo) UpdateDisplay(posCount, spread);
       return;
      }
 
-   // Spread guard — cancel pending orders if spread spikes
-   if(InpCloseOnSpread && GetSpreadPoints() > InpMaxSpread)
+   // Spread guard: cancel pending orders if spread spikes
+   if(InpCloseOnSpread && spread > InpMaxSpread)
      {
-      DeleteAllPendingOrders();
+      if(OrdersTotal() > 0)
+        {
+         Log(StringFormat("Spread guard: %.0f pts > max %d — deleting orders", spread, InpMaxSpread));
+         DeleteAllPendingOrders("spread spike");
+        }
       return;
      }
 
    if(!IsNewBar()) return;
 
-   // Always delete stale pending orders at new bar
-   DeleteAllPendingOrders();
+   // New bar: always refresh pending orders at updated price levels
+   Log(StringFormat("New bar: %s | spread=%.0f | session=%s",
+       TimeToString(g_lastBarTime, TIME_DATE|TIME_MINUTES),
+       spread, IsSessionActive() ? "ACTIVE" : "closed"));
 
-   if(!IsSessionActive())         return;
-   if(IsDailyMaxProfitReached())  return;
-   if(GetSpreadPoints() > InpMaxSpread) return;
-   if(!CheckVolatility())         return;
+   DeleteAllPendingOrders("new bar refresh");
+
+   if(!IsSessionActive())
+     {
+      Log("Skip: session not active");
+      return;
+     }
+   if(IsDailyMaxProfitReached())
+     {
+      Log("Skip: daily max profit reached");
+      return;
+     }
+   if(spread > InpMaxSpread)
+     {
+      Log(StringFormat("Skip: spread %.0f > max %d", spread, InpMaxSpread));
+      return;
+     }
+   if(!CheckVolatility())
+      return; // CheckVolatility logs its own reason
 
    PlacePendingOrders();
 
-   if(InpDisplayInfo) UpdateDisplay();
+   if(InpDisplayInfo) UpdateDisplay(posCount, spread);
   }
 
 //+------------------------------------------------------------------+
@@ -218,34 +285,29 @@ double GetSpreadPoints()
   }
 
 //+------------------------------------------------------------------+
-//| Session active check                                              |
+//| Session active check (uses times pre-parsed at init)             |
 //+------------------------------------------------------------------+
 bool IsSessionActive()
   {
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
 
-   int dow = dt.day_of_week; // 0=Sun ... 6=Sat
-   if(dow == 0 || dow == 6)                      return false;
-   if(dow == 1 && !InpMondayTrade)               return false;
-   if(dow == 2 && !InpTuesdayTrade)              return false;
-   if(dow == 3 && !InpWednesdayTrade)            return false;
-   if(dow == 4 && !InpThursdayTrade)             return false;
-   if(dow == 5 && !InpFridayTrade)               return false;
+   int dow = dt.day_of_week; // 0=Sun … 6=Sat
+   if(dow == 0 || dow == 6)           return false;
+   if(dow == 1 && !InpMondayTrade)    return false;
+   if(dow == 2 && !InpTuesdayTrade)   return false;
+   if(dow == 3 && !InpWednesdayTrade) return false;
+   if(dow == 4 && !InpThursdayTrade)  return false;
+   if(dow == 5 && !InpFridayTrade)    return false;
 
-   int startH, startM, endH, endM;
-   ParseTime(InpSessionStart, startH, startM);
-   ParseTime((dow == 5) ? InpFridayEnd : InpSessionEnd, endH, endM);
+   int nowMins = dt.hour * 60 + dt.min;
+   int endMins = (dow == 5) ? g_fridayEndMins : g_sessionEndMins;
 
-   int nowMins   = dt.hour * 60 + dt.min;
-   int startMins = startH  * 60 + startM;
-   int endMins   = endH    * 60 + endM;
-
-   return (nowMins >= startMins && nowMins < endMins);
+   return (nowMins >= g_sessionStartMins && nowMins < endMins);
   }
 
 //+------------------------------------------------------------------+
-//| Parse "HH:MM" string                                              |
+//| Parse "HH:MM" string                                             |
 //+------------------------------------------------------------------+
 void ParseTime(const string t, int &h, int &m)
   {
@@ -258,8 +320,8 @@ void ParseTime(const string t, int &h, int &m)
 //+------------------------------------------------------------------+
 bool IsDailyMaxProfitReached()
   {
-   if(InpDailyMaxProfit <= 0.0) return false;
-   if(g_dailyStartBalance <= 0.0) return false;
+   if(InpDailyMaxProfit <= 0.0)    return false;
+   if(g_dailyStartBalance <= 0.0)  return false;
    double pct = (AccountInfoDouble(ACCOUNT_BALANCE) - g_dailyStartBalance)
                 / g_dailyStartBalance * 100.0;
    return pct >= InpDailyMaxProfit;
@@ -277,6 +339,7 @@ void ResetDailyBalance()
      {
       g_dailyStartBalance = AccountInfoDouble(ACCOUNT_BALANCE);
       g_dailyResetDate    = TimeCurrent();
+      Log(StringFormat("Daily balance reset: %.2f", g_dailyStartBalance));
      }
   }
 
@@ -304,9 +367,18 @@ bool CheckVolatility()
    if(g_atrHandle == INVALID_HANDLE) return true;
    double buf[];
    ArraySetAsSeries(buf, true);
-   if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) < 1) return true;
+   if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) < 1)
+     {
+      Log("Warning: ATR buffer unavailable — skipping volatility filter");
+      return true;
+     }
    double atrPoints = buf[0] / _Point;
-   return atrPoints >= InpVolatilityScale;
+   if(atrPoints < InpVolatilityScale)
+     {
+      Log(StringFormat("Skip: ATR %.1f pts < min %.1f", atrPoints, InpVolatilityScale));
+      return false;
+     }
+   return true;
   }
 
 //+------------------------------------------------------------------+
@@ -437,36 +509,63 @@ void PlacePendingOrders()
    double tp   = InpTakeProfit * _Point;
    double sl   = InpStopLoss  * _Point;
 
+   Log(StringFormat("PlaceOrders: dir=%s ask=%.5f bid=%.5f high=%.5f low=%.5f lots=%.2f stopLvl=%.5f",
+       EnumToString(dir), ask, bid, highLevel, lowLevel, lots, stopLevel));
+
    if(dir == DIR_BUY_ONLY || dir == DIR_BOTH)
      {
       double buySL = NormalizeDouble(buyPrice - sl, _Digits);
       double buyTP = NormalizeDouble(buyPrice + tp, _Digits);
-      g_trade.BuyStop(lots, buyPrice, _Symbol, buySL, buyTP,
-                      ORDER_TIME_GTC, 0, InpTradeComment);
+      if(g_trade.BuyStop(lots, buyPrice, _Symbol, buySL, buyTP,
+                         ORDER_TIME_GTC, 0, InpTradeComment))
+         Log(StringFormat("BuyStop OK: ticket=%d price=%.5f SL=%.5f TP=%.5f",
+             (int)g_trade.ResultOrder(), buyPrice, buySL, buyTP));
+      else
+         Log(StringFormat("BuyStop FAILED: retcode=%d [%s] price=%.5f SL=%.5f TP=%.5f lots=%.2f",
+             g_trade.ResultRetcode(), g_trade.ResultComment(),
+             buyPrice, buySL, buyTP, lots));
      }
 
    if(dir == DIR_SELL_ONLY || dir == DIR_BOTH)
      {
       double sellSL = NormalizeDouble(sellPrice + sl, _Digits);
       double sellTP = NormalizeDouble(sellPrice - tp, _Digits);
-      g_trade.SellStop(lots, sellPrice, _Symbol, sellSL, sellTP,
-                       ORDER_TIME_GTC, 0, InpTradeComment);
+      if(g_trade.SellStop(lots, sellPrice, _Symbol, sellSL, sellTP,
+                          ORDER_TIME_GTC, 0, InpTradeComment))
+         Log(StringFormat("SellStop OK: ticket=%d price=%.5f SL=%.5f TP=%.5f",
+             (int)g_trade.ResultOrder(), sellPrice, sellSL, sellTP));
+      else
+         Log(StringFormat("SellStop FAILED: retcode=%d [%s] price=%.5f SL=%.5f TP=%.5f lots=%.2f",
+             g_trade.ResultRetcode(), g_trade.ResultComment(),
+             sellPrice, sellSL, sellTP, lots));
      }
   }
 
 //+------------------------------------------------------------------+
 //| Cancel all pending orders owned by this EA                       |
 //+------------------------------------------------------------------+
-void DeleteAllPendingOrders()
+void DeleteAllPendingOrders(const string reason = "")
   {
+   if(OrdersTotal() == 0) return; // fast path — nothing to do
+
+   int deleted = 0;
    for(int i = OrdersTotal() - 1; i >= 0; i--)
      {
       ulong ticket = OrderGetTicket(i);
       if(ticket == 0) continue;
-      if(OrderGetString(ORDER_SYMBOL)  == _Symbol &&
-         (int)OrderGetInteger(ORDER_MAGIC) == InpMagicNumber)
-         g_trade.OrderDelete(ticket);
+      if(OrderGetString(ORDER_SYMBOL)           != _Symbol)        continue;
+      if((int)OrderGetInteger(ORDER_MAGIC) != InpMagicNumber)      continue;
+
+      if(g_trade.OrderDelete(ticket))
+         deleted++;
+      else
+         Log(StringFormat("OrderDelete FAILED: ticket=%d retcode=%d",
+             (int)ticket, g_trade.ResultRetcode()));
      }
+
+   if(deleted > 0)
+      Log(StringFormat("Deleted %d pending order(s) [%s]", deleted,
+          reason == "" ? "unspecified" : reason));
   }
 
 //+------------------------------------------------------------------+
@@ -478,21 +577,21 @@ void ManagePositions()
      {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if((int)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber) continue;
+      if(PositionGetString(POSITION_SYMBOL)          != _Symbol)        continue;
+      if((int)PositionGetInteger(POSITION_MAGIC) != InpMagicNumber)     continue;
 
-      ENUM_POSITION_TYPE posType = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      double openPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
-      double currentSL  = PositionGetDouble(POSITION_SL);
-      double currentTP  = PositionGetDouble(POSITION_TP);
-      double volume     = PositionGetDouble(POSITION_VOLUME);
+      ENUM_POSITION_TYPE posType  = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double openPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+      double currentSL = PositionGetDouble(POSITION_SL);
+      double currentTP = PositionGetDouble(POSITION_TP);
+      double volume    = PositionGetDouble(POSITION_VOLUME);
 
-      double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double curPrice   = (posType == POSITION_TYPE_BUY) ? bid : ask;
-      double profitPts  = (posType == POSITION_TYPE_BUY)
-                          ? (bid - openPrice) / _Point
-                          : (openPrice - ask) / _Point;
+      double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double curPrice = (posType == POSITION_TYPE_BUY) ? bid : ask;
+      double profitPts = (posType == POSITION_TYPE_BUY)
+                         ? (bid - openPrice) / _Point
+                         : (openPrice - ask) / _Point;
 
       // --- Partial close (split lots) ---
       if(InpSplitLots && profitPts >= InpSplitStart && !IsTicketSplit(ticket))
@@ -503,7 +602,14 @@ void ManagePositions()
          if(closeVol >= minLot && closeVol < volume)
            {
             if(g_trade.PositionClosePartial(ticket, closeVol))
+              {
                MarkTicketSplit(ticket);
+               Log(StringFormat("Split: ticket=%d closed %.2f of %.2f lots at +%.1f pts",
+                   (int)ticket, closeVol, volume, profitPts));
+              }
+            else
+               Log(StringFormat("Split FAILED: ticket=%d retcode=%d profit=%.1f pts",
+                   (int)ticket, g_trade.ResultRetcode(), profitPts));
            }
         }
 
@@ -515,15 +621,22 @@ void ManagePositions()
                         : NormalizeDouble(openPrice - InpBreakEvenStep * _Point, _Digits);
          bool improved = (posType == POSITION_TYPE_BUY)
                          ? (newSL > currentSL + _Point)
-                         : (currentSL == 0 || newSL < currentSL - _Point);
+                         : (currentSL == 0.0 || newSL < currentSL - _Point);
          if(improved)
-            g_trade.PositionModify(ticket, newSL, currentTP);
+           {
+            if(g_trade.PositionModify(ticket, newSL, currentTP))
+               Log(StringFormat("BreakEven: ticket=%d newSL=%.5f profit=%.1f pts",
+                   (int)ticket, newSL, profitPts));
+            else
+               Log(StringFormat("BreakEven FAILED: ticket=%d retcode=%d",
+                   (int)ticket, g_trade.ResultRetcode()));
+           }
         }
 
       // --- Trailing stop ---
       if(InpTrailingOn && profitPts >= InpTrailingStart)
         {
-         double step  = InpTrailingStart * InpTrailingStopPct / 100.0 * _Point;
+         double step = InpTrailingStart * InpTrailingStopPct / 100.0 * _Point;
          double newSL;
          bool   improved;
          if(posType == POSITION_TYPE_BUY)
@@ -534,10 +647,17 @@ void ManagePositions()
          else
            {
             newSL    = NormalizeDouble(curPrice + step, _Digits);
-            improved = (currentSL == 0 || newSL < currentSL - _Point);
+            improved = (currentSL == 0.0 || newSL < currentSL - _Point);
            }
          if(improved)
-            g_trade.PositionModify(ticket, newSL, currentTP);
+           {
+            if(g_trade.PositionModify(ticket, newSL, currentTP))
+               Log(StringFormat("Trailing: ticket=%d newSL=%.5f profit=%.1f pts",
+                   (int)ticket, newSL, profitPts));
+            else
+               Log(StringFormat("Trailing FAILED: ticket=%d retcode=%d",
+                   (int)ticket, g_trade.ResultRetcode()));
+           }
         }
      }
   }
@@ -562,33 +682,52 @@ void MarkTicketSplit(ulong ticket)
 
 void CleanSplitTickets()
   {
-   for(int i = ArraySize(g_splitTickets) - 1; i >= 0; i--)
-     {
-      bool alive = false;
-      for(int j = PositionsTotal() - 1; j >= 0; j--)
-         if(PositionGetTicket(j) == g_splitTickets[i]) { alive = true; break; }
-      if(!alive)
+   if(ArraySize(g_splitTickets) == 0) return;
+   // Rebuild array keeping only tickets whose position still exists
+   ulong keep[];
+   ArrayResize(keep, 0);
+   for(int i = 0; i < ArraySize(g_splitTickets); i++)
+      if(PositionSelectByTicket(g_splitTickets[i]))
         {
-         // Shift array left to remove this entry
-         for(int k = i; k < ArraySize(g_splitTickets) - 1; k++)
-            g_splitTickets[k] = g_splitTickets[k + 1];
-         ArrayResize(g_splitTickets, ArraySize(g_splitTickets) - 1);
+         int n = ArraySize(keep);
+         ArrayResize(keep, n + 1);
+         keep[n] = g_splitTickets[i];
         }
-     }
+   ArrayFree(g_splitTickets);
+   ArrayResize(g_splitTickets, ArraySize(keep));
+   if(ArraySize(keep) > 0)
+      ArrayCopy(g_splitTickets, keep);
   }
 
 //+------------------------------------------------------------------+
 //| Display info panel                                                |
 //+------------------------------------------------------------------+
-void UpdateDisplay()
+void UpdateDisplay(const int posCount, const double spread)
   {
-   string s = "=== Gold Scalper v1.00 ===\n";
-   s += StringFormat("Balance : %.2f\n", AccountInfoDouble(ACCOUNT_BALANCE));
-   s += StringFormat("Equity  : %.2f\n", AccountInfoDouble(ACCOUNT_EQUITY));
-   s += StringFormat("Spread  : %.0f pts\n", GetSpreadPoints());
-   s += StringFormat("Session : %s\n", IsSessionActive() ? "ACTIVE" : "CLOSED");
-   s += StringFormat("Positions: %d\n", CountPositions());
-   s += StringFormat("Pending  : %d\n", OrdersTotal());
+   double atrPts = 0.0;
+   if(g_atrHandle != INVALID_HANDLE)
+     {
+      double buf[];
+      ArraySetAsSeries(buf, true);
+      if(CopyBuffer(g_atrHandle, 0, 1, 1, buf) == 1)
+         atrPts = buf[0] / _Point;
+     }
+
+   double dailyPct = 0.0;
+   if(g_dailyStartBalance > 0.0)
+      dailyPct = (AccountInfoDouble(ACCOUNT_BALANCE) - g_dailyStartBalance)
+                 / g_dailyStartBalance * 100.0;
+
+   string s = "=== Gold Scalper v1.01 ===\n";
+   s += StringFormat("Balance  : %.2f\n",   AccountInfoDouble(ACCOUNT_BALANCE));
+   s += StringFormat("Equity   : %.2f\n",   AccountInfoDouble(ACCOUNT_EQUITY));
+   s += StringFormat("Day P&L  : %+.2f%%\n", dailyPct);
+   s += StringFormat("Spread   : %.0f pts\n", spread);
+   s += StringFormat("ATR      : %.1f pts\n", atrPts);
+   s += StringFormat("Session  : %s\n",      IsSessionActive() ? "ACTIVE" : "closed");
+   s += StringFormat("Filter   : %s\n",      EnumToString(GetTradeDirection()));
+   s += StringFormat("Positions: %d\n",      posCount);
+   s += StringFormat("Pending  : %d\n",      OrdersTotal());
    if(IsDailyMaxProfitReached())
       s += ">>> Daily profit target reached <<<\n";
    Comment(s);

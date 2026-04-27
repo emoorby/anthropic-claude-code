@@ -16,7 +16,7 @@
 
    enum     LST         {Fixed=0, RiskPct=1};
    enum     Hours       {_1=1, _2=2, _3=3, _4=4, _5=5, _6=6, _7=7, _8=8, _9=9, _10=10, _11=11, _12=12, _13=13, _14=14, _15=15, _16=16, _17=17, _18=18, _19=19, _20=20, _21=21, _22=22, _23=23, _24=24};
-   enum     Minutes     {_0=0, _5=5, _10=10, _15=15, _20=20, _25=25, _30=30, _35=35, _40=40, _45=45, _50=50, _55=55};
+   enum     Minutes     {m_0=0, m_5=5, m_10=10, m_15=15, m_20=20, m_25=25, m_30=30, m_35=35, m_40=40, m_45=45, m_50=50, m_55=55};
    enum     TrSides     {Onesided=0, Bothside=1};
    enum     SLType      {Yes=0, No=1};
    enum     TrType      {RangePct=0, HighLow=1, Fixedpips=2};
@@ -32,12 +32,12 @@ input group "=== EA Specific Variables ==="
 
 input group "=== Range Parameters ==="
 
-   input    Hours             RangeStartHour          = 8;        // Start-Hour for Range          
-   input    Minutes           RangeStartMin           = 0;        // Start-Minute for Range
+   input    Hours             RangeStartHour          = 8;        // Start-Hour for Range
+   input    Minutes           RangeStartMin           = m_0;      // Start-Minute for Range
    input    Hours             RangeEndHour            = 12;       // End Hour for Range
-   input    Minutes           RangeEndMin             = 0;        // End Minutes for Range   
+   input    Minutes           RangeEndMin             = m_0;      // End Minutes for Range
    input    Hours             TradeCloseHour          = 22;       // Close Hour for Open Trades
-   input    Minutes           TradeCloseMin           = 0;        // Close Minutes for Open Trades
+   input    Minutes           TradeCloseMin           = m_0;      // Close Minutes for Open Trades
    input    color             rangecolor              = clrBeige; // Color of range on screen when within Min/Max Size
    input    int               MinRangeSize            = 15;       // Min Range Size in pips (1 pip = 10 points)
    input    int               MaxRangeSize            = 30;       // Max Range Size in pips (1 pip = 10 points)

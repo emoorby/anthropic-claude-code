@@ -152,6 +152,7 @@ int OnInit(){
 }
 
 void OnDeinit(const int reason){
+   if(atrHandle != INVALID_HANDLE) IndicatorRelease(atrHandle);
 }
 
 void OnTick(){
@@ -164,14 +165,14 @@ void OnTick(){
       MovAvgSlow.Refresh(-1);
    }
 
+   bool hasPositionNow = CountOurPositions() > 0;
+   if(hadPosition && !hasPositionNow) tradeTakenToday = true;
+   hadPosition = hasPositionNow;
+
    if(IsUpcomingNews()) return;
 
    CheckforTradeSides();
    CheckforOpenOrdersandPositions();
-
-   bool hasPositionNow = CountOurPositions() > 0;
-   if(hadPosition && !hasPositionNow) tradeTakenToday = true;
-   hadPosition = hasPositionNow;
 
    if( SLT==0 && (BuyTotal>0 || SellTotal>0) ) TrailSL();
    CheckBreakEven();

@@ -1282,6 +1282,44 @@ bool IsCloserInDir(double a, double b, double ref, int dir)
 }
 
 //+------------------------------------------------------------------+
+//| Scan a single profile for trail SL candidates                    |
+//+------------------------------------------------------------------+
+double ScanProfileForTrailSL(DailyProfile &profile, double posPrice,
+                              double bid, double ask, double padding,
+                              int dir, double currentBest)
+{
+   if(!profile.isValid) return currentBest;
+
+   for(int i = 0; i < profile.levelCount; i++)
+   {
+      if(!profile.levels[i].isHVN && !profile.levels[i].isPOC) continue;
+
+      double hvnPrice = profile.levels[i].price;
+
+      if(dir > 0)
+      {
+         if(hvnPrice > posPrice && hvnPrice < bid - InpPriceStep)
+         {
+            double candidate = hvnPrice - padding;
+            if(candidate > currentBest)
+               currentBest = candidate;
+         }
+      }
+      else
+      {
+         if(hvnPrice < posPrice && hvnPrice > ask + InpPriceStep)
+         {
+            double candidate = hvnPrice + padding;
+            if(candidate < currentBest || currentBest == 0)
+               currentBest = candidate;
+         }
+      }
+   }
+
+   return currentBest;
+}
+
+//+------------------------------------------------------------------+
 //| Trailing stop management (trail to cleared HVNs)                 |
 //+------------------------------------------------------------------+
 void ManageTrailingStop()
@@ -1297,49 +1335,10 @@ void ManageTrailingStop()
 
    double newSL = currentSL;
 
-   // Find the highest (for longs) or lowest (for shorts) HVN that price has cleared
-   // Search both current and prior profiles
-   for(int pass = 0; pass <= InpDaysBack; pass++)
-   {
-      DailyProfile *prof;
-      if(pass == 0)
-         prof = GetPointer(g_currentProfile);
-      else
-      {
-         if(pass - 1 >= InpDaysBack) continue;
-         prof = GetPointer(g_priorProfiles[pass - 1]);
-      }
+   newSL = ScanProfileForTrailSL(g_currentProfile, posPrice, bid, ask, padding, g_managedDir, newSL);
 
-      if(!prof.isValid) continue;
-
-      for(int i = 0; i < prof.levelCount; i++)
-      {
-         if(!prof.levels[i].isHVN && !prof.levels[i].isPOC) continue;
-
-         double hvnPrice = prof.levels[i].price;
-
-         if(g_managedDir > 0)
-         {
-            // Long: HVN must be above entry and below current bid (cleared)
-            if(hvnPrice > posPrice && hvnPrice < bid - InpPriceStep)
-            {
-               double candidate = hvnPrice - padding;
-               if(candidate > newSL)
-                  newSL = candidate;
-            }
-         }
-         else
-         {
-            // Short: HVN must be below entry and above current ask (cleared)
-            if(hvnPrice < posPrice && hvnPrice > ask + InpPriceStep)
-            {
-               double candidate = hvnPrice + padding;
-               if(candidate < newSL || newSL == 0)
-                  newSL = candidate;
-            }
-         }
-      }
-   }
+   for(int d = 0; d < InpDaysBack; d++)
+      newSL = ScanProfileForTrailSL(g_priorProfiles[d], posPrice, bid, ask, padding, g_managedDir, newSL);
 
    newSL = NormalizeDouble(newSL, _Digits);
 

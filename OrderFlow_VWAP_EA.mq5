@@ -3,8 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "1.00"
+#property version   "2.00"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
+#property description "v2: Confluence scoring, dynamic SL/TP, trailing stop"
 
 #include <Trade\Trade.mqh>
 
@@ -13,6 +14,22 @@ enum ENUM_DELTA_METHOD
    DELTA_AUTO,       // Auto-detect
    DELTA_TICK_FLAGS, // Tick flags (exchange)
    DELTA_TICK_RULE   // Tick rule (CFD/Forex)
+};
+
+enum ENUM_SL_MODE
+{
+   SL_FIXED,         // Fixed points
+   SL_BELOW_HVN,     // Beyond nearest HVN
+   SL_BEYOND_VA,     // Beyond Value Area boundary
+   SL_STRUCTURAL     // Best of HVN or VA (whichever is tighter)
+};
+
+enum ENUM_TP_MODE
+{
+   TP_FIXED,         // Fixed points
+   TP_NEXT_LVN,      // Next LVN in trade direction
+   TP_NEXT_HVN,      // Next HVN in trade direction
+   TP_MULTI_TARGET   // TP1 at LVN (partial), TP2 at next HVN/POC
 };
 
 //--- Inputs
@@ -56,9 +73,38 @@ input group "=== Trading ==="
 input bool           InpEnableTrading    = false;       // Enable Auto Trading
 input double         InpLotSize          = 0.1;         // Lot Size (fixed)
 input double         InpRiskPercent      = 0.0;         // Risk % (0=fixed lot)
-input double         InpSLPoints         = 50.0;        // Stop Loss (points)
-input double         InpTPPoints         = 100.0;       // Take Profit (points)
-input int            InpMinDelta         = 30;          // Min |Delta| for Signal
+input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Session
+
+input group "=== Confluence Scoring ==="
+input int            InpMinScore         = 4;           // Min Score to Enter (max ~9)
+input int            InpDeltaRocSeconds  = 30;          // Delta ROC Lookback (seconds)
+input double         InpDeltaRocMin      = 5.0;         // Min Delta ROC for +1 Score
+input double         InpMinBarVolRatio   = 1.2;         // Min Volume Ratio vs Average
+
+input group "=== Active Trading Window ==="
+input int            InpActiveStartHour  = 15;          // Active Window Start Hour
+input int            InpActiveStartMin   = 30;          // Active Window Start Minute
+input int            InpActiveEndHour    = 19;          // Active Window End Hour
+input int            InpActiveEndMin     = 0;           // Active Window End Minute
+
+input group "=== Stop Loss ==="
+input ENUM_SL_MODE   InpSLMode           = SL_STRUCTURAL; // SL Placement Mode
+input double         InpSLFallbackPts    = 50.0;        // Fallback SL (points, if no node)
+input double         InpSLPaddingPts     = 10.0;        // SL Padding Beyond Node (points)
+input double         InpMaxSLPts         = 100.0;       // Max SL Distance (points)
+
+input group "=== Take Profit ==="
+input ENUM_TP_MODE   InpTPMode           = TP_MULTI_TARGET; // TP Mode
+input double         InpTPFallbackPts    = 100.0;       // Fallback TP (points, if no node)
+input double         InpPartialClosePct  = 50.0;        // % to Close at TP1
+
+input group "=== Trailing Stop ==="
+input bool           InpUseTrailing      = true;        // Trail Stop to Cleared HVNs
+input double         InpTrailPaddingPts  = 5.0;         // Trail Padding Below HVN (points)
+
+input group "=== Cooldown ==="
+input int            InpCooldownSeconds  = 300;         // Seconds Before Re-entry at Same Zone
+input double         InpCooldownZoneSize = 3.0;         // Zone Size (price steps)
 
 //--- Structures
 struct PriceLevel
@@ -91,6 +137,18 @@ struct DailyProfile
    bool       isValid;
 };
 
+struct TradedZone
+{
+   double price;
+   datetime time;
+};
+
+struct DeltaSnapshot
+{
+   double delta;
+   datetime time;
+};
+
 //--- Globals
 CTrade         g_trade;
 DailyProfile   g_priorProfiles[];
@@ -104,6 +162,22 @@ datetime       g_todaySessionEnd;
 datetime       g_lastCalcTime;
 bool           g_useTickFlags;
 string         g_objPrefix;
+
+// Confluence & filter state
+DeltaSnapshot  g_deltaSnaps[200];
+int            g_deltaSnapCount;
+int            g_deltaSnapIdx;
+TradedZone     g_tradedZones[50];
+int            g_tradedZoneCount;
+int            g_tradesToday;
+datetime       g_lastTradeDay;
+
+// Position management
+ulong          g_managedTicket;
+int            g_managedDir;       // 1=long, -1=short
+double         g_tp2Price;
+bool           g_tp1Hit;
+double         g_lastTrailPrice;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -131,10 +205,23 @@ int OnInit()
    if(InpExportCSV)
       ExportAllProfiles();
 
+   // Initialize filter state
+   g_deltaSnapCount = 0;
+   g_deltaSnapIdx   = 0;
+   g_tradedZoneCount = 0;
+   g_tradesToday    = 0;
+   g_lastTradeDay   = 0;
+   g_managedTicket  = 0;
+   g_managedDir     = 0;
+   g_tp2Price       = 0;
+   g_tp1Hit         = false;
+   g_lastTrailPrice = 0;
+
    EventSetMillisecondTimer(3000);
 
-   Print("OrderFlow VWAP EA initialized. Delta method: ",
-         g_useTickFlags ? "Tick Flags" : "Tick Rule");
+   Print("OrderFlow VWAP EA v2 initialized. Delta method: ",
+         g_useTickFlags ? "Tick Flags" : "Tick Rule",
+         " | Min score: ", InpMinScore);
    return(INIT_SUCCEEDED);
 }
 
@@ -155,6 +242,12 @@ void OnTick()
 
    if(!g_currentProfile.isValid) return;
 
+   if(InpUseTrailing && g_managedTicket > 0)
+      ManageTrailingStop();
+
+   if(InpTPMode == TP_MULTI_TARGET && g_managedTicket > 0 && !g_tp1Hit)
+      CheckTP1PartialClose();
+
    CheckSignals();
 }
 
@@ -172,6 +265,10 @@ void OnTimer()
    {
       g_todaySessionStart = todayStart;
       g_todaySessionEnd   = todayEnd;
+      g_tradedZoneCount   = 0;
+      g_tradesToday       = 0;
+      g_deltaSnapCount    = 0;
+      g_deltaSnapIdx      = 0;
       BuildPriorProfiles();
       if(InpDrawProfiles) DrawAllPriorProfiles();
       if(InpExportCSV) ExportAllProfiles();
@@ -187,6 +284,8 @@ void OnTimer()
             CalculateVWAP(g_todaySessionStart, now);
             g_currentProfile.vwap = g_vwap;
 
+            RecordDeltaSnapshot(g_cumDelta, now);
+
             if(InpDrawCurrentLive)
             {
                RemoveObjectsWithPrefix(g_objPrefix + "CUR_");
@@ -199,6 +298,13 @@ void OnTimer()
          }
          g_lastCalcTime = now;
       }
+   }
+
+   if(g_managedTicket > 0 && !PositionSelectByTicket(g_managedTicket))
+   {
+      g_managedTicket = 0;
+      g_managedDir    = 0;
+      g_tp1Hit        = false;
    }
 }
 
@@ -788,71 +894,619 @@ void ExportSingleProfile(DailyProfile &profile, string suffix)
 }
 
 //+------------------------------------------------------------------+
-//| Signal logic                                                      |
+//| Delta snapshot ring buffer                                       |
+//+------------------------------------------------------------------+
+void RecordDeltaSnapshot(double delta, datetime time)
+{
+   int maxSnaps = ArraySize(g_deltaSnaps);
+   g_deltaSnaps[g_deltaSnapIdx].delta = delta;
+   g_deltaSnaps[g_deltaSnapIdx].time  = time;
+   g_deltaSnapIdx = (g_deltaSnapIdx + 1) % maxSnaps;
+   if(g_deltaSnapCount < maxSnaps)
+      g_deltaSnapCount++;
+}
+
+double GetDeltaROC(datetime now)
+{
+   if(g_deltaSnapCount < 2) return 0;
+
+   double currentDelta = g_cumDelta;
+   datetime cutoff = now - InpDeltaRocSeconds;
+
+   int maxSnaps = ArraySize(g_deltaSnaps);
+   double oldestDelta = currentDelta;
+   datetime oldestTime = now;
+   bool found = false;
+
+   for(int k = 0; k < g_deltaSnapCount; k++)
+   {
+      int idx = (g_deltaSnapIdx - 1 - k + maxSnaps * 2) % maxSnaps;
+      if(g_deltaSnaps[idx].time <= cutoff)
+      {
+         oldestDelta = g_deltaSnaps[idx].delta;
+         oldestTime  = g_deltaSnaps[idx].time;
+         found = true;
+         break;
+      }
+   }
+
+   if(!found)
+   {
+      int idx = (g_deltaSnapIdx - g_deltaSnapCount + maxSnaps * 2) % maxSnaps;
+      oldestDelta = g_deltaSnaps[idx].delta;
+      oldestTime  = g_deltaSnaps[idx].time;
+   }
+
+   double elapsed = (double)(now - oldestTime);
+   if(elapsed <= 0) return 0;
+
+   return (currentDelta - oldestDelta) / elapsed * InpDeltaRocSeconds;
+}
+
+//+------------------------------------------------------------------+
+//| Cooldown zone tracking                                           |
+//+------------------------------------------------------------------+
+void RecordTradedZone(double price, datetime time)
+{
+   if(g_tradedZoneCount < ArraySize(g_tradedZones))
+   {
+      g_tradedZones[g_tradedZoneCount].price = price;
+      g_tradedZones[g_tradedZoneCount].time  = time;
+      g_tradedZoneCount++;
+   }
+}
+
+bool IsInCooldown(double price, datetime now)
+{
+   for(int i = 0; i < g_tradedZoneCount; i++)
+   {
+      double dist = MathAbs(price - g_tradedZones[i].price) / InpPriceStep;
+      int elapsed = (int)(now - g_tradedZones[i].time);
+      if(dist <= InpCooldownZoneSize && elapsed < InpCooldownSeconds)
+         return true;
+   }
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| Active trading window check                                      |
+//+------------------------------------------------------------------+
+bool IsWithinActiveWindow(datetime now)
+{
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   int nowMins  = dt.hour * 60 + dt.min;
+   int startMins = InpActiveStartHour * 60 + InpActiveStartMin;
+   int endMins   = InpActiveEndHour * 60 + InpActiveEndMin;
+   return (nowMins >= startMins && nowMins <= endMins);
+}
+
+//+------------------------------------------------------------------+
+//| Volume confirmation (current bar vs recent average)              |
+//+------------------------------------------------------------------+
+bool IsVolumeAboveAverage()
+{
+   long volumes[];
+   int bars = CopyTickVolume(_Symbol, PERIOD_M1, 0, 30, volumes);
+   if(bars < 5) return true;
+
+   double avg = 0;
+   for(int i = 1; i < bars; i++)
+      avg += (double)volumes[i];
+   avg /= (bars - 1);
+
+   if(avg <= 0) return true;
+   return ((double)volumes[0] / avg) >= InpMinBarVolRatio;
+}
+
+//+------------------------------------------------------------------+
+//| Confluence scoring                                               |
+//+------------------------------------------------------------------+
+int GetConfluenceScore(double price, int direction)
+{
+   int score = 0;
+   datetime now = TimeCurrent();
+
+   // 1. VWAP alignment (+1)
+   if(direction > 0 && price <= g_vwap) score++;
+   if(direction < 0 && price >= g_vwap) score++;
+
+   // 2. At current session HVN or POC (+1)
+   int lvl = FindNearestLevel(g_currentProfile, price);
+   if(lvl >= 0)
+   {
+      if(g_currentProfile.levels[lvl].isHVN ||
+         g_currentProfile.levels[lvl].isPOC)
+         score++;
+   }
+
+   // 3. Near prior day POC (+2 - strong level)
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
+      if(dist <= 2.0)
+      {
+         score += 2;
+         break;
+      }
+   }
+
+   // 4. Near prior VAL (for longs) or VAH (for shorts) (+1)
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      if(direction > 0)
+      {
+         double dist = MathAbs(price - g_priorProfiles[d].valPrice) / InpPriceStep;
+         if(dist <= 2.0) { score++; break; }
+      }
+      else
+      {
+         double dist = MathAbs(price - g_priorProfiles[d].vahPrice) / InpPriceStep;
+         if(dist <= 2.0) { score++; break; }
+      }
+   }
+
+   // 5. Near prior HVN (+1)
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      for(int i = 0; i < g_priorProfiles[d].levelCount; i++)
+      {
+         if(!g_priorProfiles[d].levels[i].isHVN) continue;
+         double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
+         if(dist <= 2.0) { score++; d = InpDaysBack; break; }
+      }
+   }
+
+   // 6. Delta in favor (+1)
+   if(direction > 0 && g_cumDelta > 0) score++;
+   if(direction < 0 && g_cumDelta < 0) score++;
+
+   // 7. Delta ROC accelerating in trade direction (+1)
+   double roc = GetDeltaROC(now);
+   if(direction > 0 && roc >= InpDeltaRocMin) score++;
+   if(direction < 0 && roc <= -InpDeltaRocMin) score++;
+
+   // 8. Volume above average (+1)
+   if(IsVolumeAboveAverage()) score++;
+
+   return score;
+}
+
+//+------------------------------------------------------------------+
+//| Dynamic SL placement                                             |
+//+------------------------------------------------------------------+
+double FindStructuralSL(double entryPrice, int direction)
+{
+   double bestSL = 0;
+   double padding = InpSLPaddingPts * _Point;
+   double maxDist = InpMaxSLPts * _Point;
+
+   if(InpSLMode == SL_FIXED)
+   {
+      if(direction > 0)
+         return entryPrice - InpSLFallbackPts * _Point;
+      else
+         return entryPrice + InpSLFallbackPts * _Point;
+   }
+
+   // Search current profile for structural levels
+   if(g_currentProfile.isValid)
+      bestSL = FindSLInProfile(g_currentProfile, entryPrice, direction, padding, maxDist);
+
+   // Search prior profiles if nothing found
+   if(bestSL == 0)
+   {
+      for(int d = 0; d < InpDaysBack; d++)
+      {
+         if(!g_priorProfiles[d].isValid) continue;
+         double sl = FindSLInProfile(g_priorProfiles[d], entryPrice, direction, padding, maxDist);
+         if(sl != 0)
+         {
+            if(bestSL == 0) { bestSL = sl; }
+            else if(direction > 0 && sl > bestSL) bestSL = sl;
+            else if(direction < 0 && sl < bestSL) bestSL = sl;
+         }
+      }
+   }
+
+   if(bestSL == 0)
+   {
+      if(direction > 0) bestSL = entryPrice - InpSLFallbackPts * _Point;
+      else              bestSL = entryPrice + InpSLFallbackPts * _Point;
+   }
+
+   double dist = MathAbs(entryPrice - bestSL);
+   if(dist > maxDist)
+   {
+      if(direction > 0) bestSL = entryPrice - maxDist;
+      else              bestSL = entryPrice + maxDist;
+   }
+
+   return NormalizeDouble(bestSL, _Digits);
+}
+
+double FindSLInProfile(DailyProfile &profile, double entry, int dir,
+                        double padding, double maxDist)
+{
+   double best = 0;
+
+   for(int i = 0; i < profile.levelCount; i++)
+   {
+      bool isStructural = false;
+
+      if(InpSLMode == SL_BELOW_HVN || InpSLMode == SL_STRUCTURAL)
+         if(profile.levels[i].isHVN || profile.levels[i].isPOC)
+            isStructural = true;
+
+      if(InpSLMode == SL_BEYOND_VA || InpSLMode == SL_STRUCTURAL)
+         if(MathAbs(profile.levels[i].price - profile.vahPrice) < InpPriceStep * 0.5 ||
+            MathAbs(profile.levels[i].price - profile.valPrice) < InpPriceStep * 0.5)
+            isStructural = true;
+
+      if(!isStructural) continue;
+
+      double lvlPrice = profile.levels[i].price;
+
+      if(dir > 0 && lvlPrice < entry)
+      {
+         double slCandidate = lvlPrice - padding;
+         if(entry - slCandidate <= maxDist)
+         {
+            if(best == 0 || slCandidate > best)
+               best = slCandidate;
+         }
+      }
+      else if(dir < 0 && lvlPrice > entry)
+      {
+         double slCandidate = lvlPrice + padding;
+         if(slCandidate - entry <= maxDist)
+         {
+            if(best == 0 || slCandidate < best)
+               best = slCandidate;
+         }
+      }
+   }
+
+   return best;
+}
+
+//+------------------------------------------------------------------+
+//| Dynamic TP placement                                             |
+//+------------------------------------------------------------------+
+void FindTargetTP(double entryPrice, int direction,
+                  double &tp1Out, double &tp2Out)
+{
+   tp1Out = 0;
+   tp2Out = 0;
+
+   if(InpTPMode == TP_FIXED)
+   {
+      if(direction > 0) tp1Out = entryPrice + InpTPFallbackPts * _Point;
+      else              tp1Out = entryPrice - InpTPFallbackPts * _Point;
+      return;
+   }
+
+   double nearestLVN = 0;
+   double nearestHVN = 0;
+   double nearestPOC = 0;
+
+   // Search current session profile
+   if(g_currentProfile.isValid)
+      FindTPLevels(g_currentProfile, entryPrice, direction,
+                   nearestLVN, nearestHVN, nearestPOC);
+
+   // Search prior profiles for additional levels
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      double lvn2 = 0, hvn2 = 0, poc2 = 0;
+      FindTPLevels(g_priorProfiles[d], entryPrice, direction,
+                   lvn2, hvn2, poc2);
+
+      if(lvn2 != 0 && (nearestLVN == 0 || IsCloserInDir(lvn2, nearestLVN, entryPrice, direction)))
+         nearestLVN = lvn2;
+      if(hvn2 != 0 && (nearestHVN == 0 || IsCloserInDir(hvn2, nearestHVN, entryPrice, direction)))
+         nearestHVN = hvn2;
+      if(poc2 != 0 && (nearestPOC == 0 || IsCloserInDir(poc2, nearestPOC, entryPrice, direction)))
+         nearestPOC = poc2;
+   }
+
+   if(InpTPMode == TP_NEXT_LVN)
+   {
+      tp1Out = nearestLVN;
+   }
+   else if(InpTPMode == TP_NEXT_HVN)
+   {
+      tp1Out = nearestHVN;
+   }
+   else if(InpTPMode == TP_MULTI_TARGET)
+   {
+      tp1Out = nearestLVN;
+      // TP2 = next HVN beyond TP1, or prior POC if further
+      if(nearestHVN != 0)
+      {
+         bool hvnBeyondLvn = (direction > 0)
+            ? (nearestHVN > nearestLVN || nearestLVN == 0)
+            : (nearestHVN < nearestLVN || nearestLVN == 0);
+         if(hvnBeyondLvn) tp2Out = nearestHVN;
+      }
+      if(tp2Out == 0 && nearestPOC != 0) tp2Out = nearestPOC;
+   }
+
+   // Fallbacks
+   if(tp1Out == 0)
+   {
+      if(direction > 0) tp1Out = entryPrice + InpTPFallbackPts * _Point;
+      else              tp1Out = entryPrice - InpTPFallbackPts * _Point;
+   }
+
+   tp1Out = NormalizeDouble(tp1Out, _Digits);
+   if(tp2Out != 0)
+      tp2Out = NormalizeDouble(tp2Out, _Digits);
+}
+
+void FindTPLevels(DailyProfile &profile, double entry, int dir,
+                  double &lvnOut, double &hvnOut, double &pocOut)
+{
+   for(int i = 0; i < profile.levelCount; i++)
+   {
+      double p = profile.levels[i].price;
+      bool inDir = (dir > 0) ? (p > entry + InpPriceStep) : (p < entry - InpPriceStep);
+      if(!inDir) continue;
+
+      if(profile.levels[i].isLVN)
+      {
+         if(lvnOut == 0 || IsCloserInDir(p, lvnOut, entry, dir))
+            lvnOut = p;
+      }
+      if(profile.levels[i].isHVN)
+      {
+         if(hvnOut == 0 || IsCloserInDir(p, hvnOut, entry, dir))
+            hvnOut = p;
+      }
+      if(profile.levels[i].isPOC)
+      {
+         if(pocOut == 0 || IsCloserInDir(p, pocOut, entry, dir))
+            pocOut = p;
+      }
+   }
+}
+
+bool IsCloserInDir(double a, double b, double ref, int dir)
+{
+   if(dir > 0) return (a - ref) < (b - ref);
+   return (ref - a) < (ref - b);
+}
+
+//+------------------------------------------------------------------+
+//| Trailing stop management (trail to cleared HVNs)                 |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   if(!PositionSelectByTicket(g_managedTicket)) return;
+
+   double currentSL = PositionGetDouble(POSITION_SL);
+   double currentTP = PositionGetDouble(POSITION_TP);
+   double posPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double padding = InpTrailPaddingPts * _Point;
+
+   double newSL = currentSL;
+
+   // Find the highest (for longs) or lowest (for shorts) HVN that price has cleared
+   // Search both current and prior profiles
+   for(int pass = 0; pass <= InpDaysBack; pass++)
+   {
+      DailyProfile *prof;
+      if(pass == 0)
+         prof = GetPointer(g_currentProfile);
+      else
+      {
+         if(pass - 1 >= InpDaysBack) continue;
+         prof = GetPointer(g_priorProfiles[pass - 1]);
+      }
+
+      if(!prof.isValid) continue;
+
+      for(int i = 0; i < prof.levelCount; i++)
+      {
+         if(!prof.levels[i].isHVN && !prof.levels[i].isPOC) continue;
+
+         double hvnPrice = prof.levels[i].price;
+
+         if(g_managedDir > 0)
+         {
+            // Long: HVN must be above entry and below current bid (cleared)
+            if(hvnPrice > posPrice && hvnPrice < bid - InpPriceStep)
+            {
+               double candidate = hvnPrice - padding;
+               if(candidate > newSL)
+                  newSL = candidate;
+            }
+         }
+         else
+         {
+            // Short: HVN must be below entry and above current ask (cleared)
+            if(hvnPrice < posPrice && hvnPrice > ask + InpPriceStep)
+            {
+               double candidate = hvnPrice + padding;
+               if(candidate < newSL || newSL == 0)
+                  newSL = candidate;
+            }
+         }
+      }
+   }
+
+   newSL = NormalizeDouble(newSL, _Digits);
+
+   if(g_managedDir > 0 && newSL > currentSL && newSL < bid)
+   {
+      if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
+         Print("Trail SL moved to ", newSL, " (HVN cleared)");
+   }
+   else if(g_managedDir < 0 && (newSL < currentSL || currentSL == 0) && newSL > ask)
+   {
+      if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
+         Print("Trail SL moved to ", newSL, " (HVN cleared)");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Partial close at TP1                                             |
+//+------------------------------------------------------------------+
+void CheckTP1PartialClose()
+{
+   if(!PositionSelectByTicket(g_managedTicket)) return;
+   if(g_tp1Hit) return;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double currentTP = PositionGetDouble(POSITION_TP);
+
+   bool tp1Reached = false;
+   if(g_managedDir > 0 && bid >= currentTP) tp1Reached = true;
+   if(g_managedDir < 0 && ask <= currentTP) tp1Reached = true;
+
+   if(!tp1Reached) return;
+
+   double posVol = PositionGetDouble(POSITION_VOLUME);
+   double closeVol = NormalizeDouble(posVol * InpPartialClosePct / 100.0,
+                                      (int)MathLog10(1.0 / SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP)));
+
+   double minLot = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   closeVol = MathFloor(closeVol / lotStep) * lotStep;
+   if(closeVol < minLot) closeVol = minLot;
+
+   double remaining = posVol - closeVol;
+   if(remaining < minLot)
+   {
+      g_tp1Hit = true;
+      return;
+   }
+
+   if(g_trade.PositionClosePartial(g_managedTicket, closeVol))
+   {
+      Print("TP1 partial close: ", closeVol, " lots at ",
+            (g_managedDir > 0) ? bid : ask);
+      g_tp1Hit = true;
+
+      // Move TP to TP2 for the remainder
+      if(g_tp2Price > 0 && PositionSelectByTicket(g_managedTicket))
+      {
+         double sl = PositionGetDouble(POSITION_SL);
+         g_trade.PositionModify(g_managedTicket, sl, g_tp2Price);
+         Print("TP moved to TP2: ", g_tp2Price);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Signal logic with confluence scoring                             |
 //+------------------------------------------------------------------+
 void CheckSignals()
 {
    if(!g_currentProfile.isValid || g_vwap <= 0) return;
 
+   datetime now = TimeCurrent();
+
+   // --- Pre-filters (fast rejection) ---
+
+   if(!IsWithinActiveWindow(now)) return;
+
+   MqlDateTime dtNow;
+   TimeToStruct(now, dtNow);
+   datetime today = (datetime)(now - now % 86400);
+   if(today != g_lastTradeDay)
+   {
+      g_tradesToday = 0;
+      g_lastTradeDay = today;
+   }
+   if(g_tradesToday >= InpMaxTradesPerDay) return;
+
+   if(HasOpenPosition()) return;
+
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
-   bool aboveVWAP = (mid > g_vwap);
-   bool belowVWAP = (mid < g_vwap);
+   if(IsInCooldown(mid, now)) return;
 
-   double sessionDelta = g_cumDelta;
-   bool positiveDelta = (sessionDelta > InpMinDelta);
-   bool negativeDelta = (sessionDelta < -InpMinDelta);
+   // --- Score both directions ---
+   int longScore  = GetConfluenceScore(mid, 1);
+   int shortScore = GetConfluenceScore(mid, -1);
 
-   int nearestLevel = FindNearestLevel(g_currentProfile, mid);
-   if(nearestLevel < 0) return;
+   // --- Determine best direction if either qualifies ---
+   int tradeDir = 0;
 
-   bool atHVN = g_currentProfile.levels[nearestLevel].isHVN ||
-                g_currentProfile.levels[nearestLevel].isPOC;
-   bool atLVN = g_currentProfile.levels[nearestLevel].isLVN;
+   if(longScore >= InpMinScore && longScore > shortScore)
+      tradeDir = 1;
+   else if(shortScore >= InpMinScore && shortScore > longScore)
+      tradeDir = -1;
+   else if(longScore >= InpMinScore && longScore == shortScore)
+      return; // conflicting — skip
 
-   bool nearPriorPOC = false;
-   bool nearPriorVAL = false;
-   bool nearPriorVAH = false;
+   if(tradeDir == 0) return;
 
-   for(int d = 0; d < InpDaysBack; d++)
+   // --- Calculate dynamic SL/TP ---
+   double entryPrice = (tradeDir > 0) ? ask : bid;
+   double sl = FindStructuralSL(entryPrice, tradeDir);
+   double slDist = MathAbs(entryPrice - sl);
+
+   double tp1 = 0, tp2 = 0;
+   FindTargetTP(entryPrice, tradeDir, tp1, tp2);
+
+   // Require reward >= risk
+   double tp1Dist = MathAbs(tp1 - entryPrice);
+   if(tp1Dist < slDist * 0.9)
    {
-      if(!g_priorProfiles[d].isValid) continue;
-      double dist = MathAbs(mid - g_priorProfiles[d].pocPrice) / InpPriceStep;
-      if(dist <= 2) nearPriorPOC = true;
-      dist = MathAbs(mid - g_priorProfiles[d].valPrice) / InpPriceStep;
-      if(dist <= 2) nearPriorVAL = true;
-      dist = MathAbs(mid - g_priorProfiles[d].vahPrice) / InpPriceStep;
-      if(dist <= 2) nearPriorVAH = true;
+      Print("Skipping: R:R too low. TP1=", tp1Dist / _Point,
+            " pts vs SL=", slDist / _Point, " pts");
+      return;
    }
 
-   if(!HasOpenPosition())
-   {
-      // Long: price at/near VWAP or HVN/POC support, positive delta
-      if(belowVWAP && positiveDelta && (atHVN || nearPriorPOC || nearPriorVAL))
-      {
-         double sl = ask - InpSLPoints * _Point;
-         double tp = ask + InpTPPoints * _Point;
-         double lots = GetLotSize(InpSLPoints * _Point);
-         g_trade.Buy(lots, _Symbol, ask, sl, tp, InpComment + " LONG");
-         Print("LONG signal: VWAP=", g_vwap, " Delta=", sessionDelta,
-               " at HVN/POC=", atHVN, " nearPriorPOC=", nearPriorPOC);
-      }
+   double lots = GetLotSize(slDist);
+   int score = (tradeDir > 0) ? longScore : shortScore;
 
-      // Short: price above VWAP at resistance, negative delta
-      if(aboveVWAP && negativeDelta && (atHVN || nearPriorPOC || nearPriorVAH))
-      {
-         double sl = bid + InpSLPoints * _Point;
-         double tp = bid - InpTPPoints * _Point;
-         double lots = GetLotSize(InpSLPoints * _Point);
-         g_trade.Sell(lots, _Symbol, bid, sl, tp, InpComment + " SHORT");
-         Print("SHORT signal: VWAP=", g_vwap, " Delta=", sessionDelta,
-               " at HVN/POC=", atHVN, " nearPriorPOC=", nearPriorPOC);
-      }
+   string comment = InpComment + ((tradeDir > 0) ? " L" : " S") +
+                     " s" + IntegerToString(score);
+
+   // --- Execute ---
+   bool success = false;
+   if(tradeDir > 0)
+      success = g_trade.Buy(lots, _Symbol, ask, sl, tp1, comment);
+   else
+      success = g_trade.Sell(lots, _Symbol, bid, sl, tp1, comment);
+
+   if(success)
+   {
+      g_managedTicket = g_trade.ResultOrder();
+      g_managedDir    = tradeDir;
+      g_tp2Price      = tp2;
+      g_tp1Hit        = (InpTPMode != TP_MULTI_TARGET || tp2 == 0);
+      g_lastTrailPrice = entryPrice;
+      g_tradesToday++;
+
+      RecordTradedZone(mid, now);
+
+      Print((tradeDir > 0 ? "LONG" : "SHORT"),
+            " | Score: ", score,
+            " | Entry: ", entryPrice,
+            " | SL: ", sl, " (", slDist / _Point, " pts)",
+            " | TP1: ", tp1, " (", tp1Dist / _Point, " pts)",
+            " | TP2: ", (tp2 > 0 ? DoubleToString(tp2, _Digits) : "none"),
+            " | DeltaROC: ", DoubleToString(GetDeltaROC(now), 1),
+            " | Lots: ", lots);
    }
 }
 
+//+------------------------------------------------------------------+
+//| Helpers                                                          |
+//+------------------------------------------------------------------+
 int FindNearestLevel(DailyProfile &profile, double price)
 {
    if(profile.levelCount == 0) return -1;

@@ -98,6 +98,8 @@ input double         InpMinSL            = 10.0;        // Min SL Distance (pric
 input group "=== Take Profit ==="
 input ENUM_TP_MODE   InpTPMode           = TP_MULTI_TARGET; // TP Mode
 input double         InpTPFallback       = 40.0;        // Fallback TP (price units, if no level)
+input double         InpMinTP            = 15.0;        // Min TP Distance (price units)
+input double         InpMinRR            = 1.0;         // Min Reward:Risk Ratio
 input double         InpPartialClosePct  = 50.0;        // % to Close at TP1
 
 input group "=== Trailing Stop ==="
@@ -1290,11 +1292,36 @@ void FindTargetTP(double entryPrice, int direction,
       if(tp2Out == 0 && nearestPOC != 0) tp2Out = nearestPOC;
    }
 
-   // Fallbacks
+   // Fallback if no structural level found
    if(tp1Out == 0)
    {
       if(direction > 0) tp1Out = entryPrice + InpTPFallback;
       else              tp1Out = entryPrice - InpTPFallback;
+   }
+
+   // Enforce minimum TP distance
+   double tp1Dist = MathAbs(tp1Out - entryPrice);
+   if(tp1Dist < InpMinTP)
+   {
+      if(direction > 0) tp1Out = entryPrice + InpMinTP;
+      else              tp1Out = entryPrice - InpMinTP;
+   }
+
+   if(tp2Out != 0)
+   {
+      double tp2Dist = MathAbs(tp2Out - entryPrice);
+      if(tp2Dist < InpMinTP)
+      {
+         if(direction > 0) tp2Out = entryPrice + InpTPFallback;
+         else              tp2Out = entryPrice - InpTPFallback;
+      }
+   }
+
+   // Ensure TP2 is further than TP1
+   if(tp2Out != 0)
+   {
+      bool tp2Further = (direction > 0) ? (tp2Out > tp1Out) : (tp2Out < tp1Out);
+      if(!tp2Further) tp2Out = 0;
    }
 
    tp1Out = NormalizeDouble(tp1Out, _Digits);
@@ -1308,8 +1335,12 @@ void FindTPLevels(DailyProfile &profile, double entry, int dir,
    for(int i = 0; i < profile.levelCount; i++)
    {
       double p = profile.levels[i].price;
+      double dist = MathAbs(p - entry);
+
+      // Must be in trade direction AND beyond minimum TP distance
       bool inDir = (dir > 0) ? (p > entry + InpPriceStep) : (p < entry - InpPriceStep);
       if(!inDir) continue;
+      if(dist < InpMinTP) continue;
 
       if(profile.levels[i].isLVN)
       {
@@ -1522,7 +1553,7 @@ void CheckSignals()
    double tp1Dist = MathAbs(tp1 - entryPrice);
 
    // Require reward >= risk
-   if(tp1Dist < slDist * 0.9)
+   if(tp1Dist < slDist * InpMinRR)
    {
       RecordTradedZone(mid, now);
       Print("Skipping: R:R too low. TP1=", tp1Dist / _Point,

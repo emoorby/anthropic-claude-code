@@ -18,10 +18,11 @@ enum ENUM_DELTA_METHOD
 
 enum ENUM_SL_MODE
 {
-   SL_FIXED,         // Fixed points
-   SL_BELOW_HVN,     // Beyond nearest HVN
+   SL_COMPOSITE,     // Furthest of: next LVN, VA boundary, prior POC
+   SL_BEYOND_LVN,    // Beyond next LVN (opposite direction)
    SL_BEYOND_VA,     // Beyond Value Area boundary
-   SL_STRUCTURAL     // Best of HVN or VA (whichever is tighter)
+   SL_PRIOR_POC,     // Beyond prior session POC
+   SL_FIXED          // Fixed distance (price units)
 };
 
 enum ENUM_TP_MODE
@@ -88,19 +89,20 @@ input int            InpActiveEndHour    = 19;          // Active Window End Hou
 input int            InpActiveEndMin     = 0;           // Active Window End Minute
 
 input group "=== Stop Loss ==="
-input ENUM_SL_MODE   InpSLMode           = SL_STRUCTURAL; // SL Placement Mode
-input double         InpSLFallbackPts    = 50.0;        // Fallback SL (points, if no node)
-input double         InpSLPaddingPts     = 10.0;        // SL Padding Beyond Node (points)
-input double         InpMaxSLPts         = 100.0;       // Max SL Distance (points)
+input ENUM_SL_MODE   InpSLMode           = SL_COMPOSITE; // SL Placement Mode
+input double         InpSLFallback       = 30.0;        // Fallback SL (price units, if no level)
+input double         InpSLPadding        = 2.0;         // SL Padding Beyond Level (price units)
+input double         InpMaxSL            = 80.0;        // Max SL Distance (price units)
+input double         InpMinSL            = 10.0;        // Min SL Distance (price units)
 
 input group "=== Take Profit ==="
 input ENUM_TP_MODE   InpTPMode           = TP_MULTI_TARGET; // TP Mode
-input double         InpTPFallbackPts    = 100.0;       // Fallback TP (points, if no node)
+input double         InpTPFallback       = 40.0;        // Fallback TP (price units, if no level)
 input double         InpPartialClosePct  = 50.0;        // % to Close at TP1
 
 input group "=== Trailing Stop ==="
 input bool           InpUseTrailing      = true;        // Trail Stop to Cleared HVNs
-input double         InpTrailPaddingPts  = 5.0;         // Trail Padding Below HVN (points)
+input double         InpTrailPadding     = 2.0;         // Trail Padding Beyond HVN (price units)
 
 input group "=== Cooldown ==="
 input int            InpCooldownSeconds  = 300;         // Seconds Before Re-entry at Same Zone
@@ -1080,97 +1082,149 @@ int GetConfluenceScore(double price, int direction)
 //+------------------------------------------------------------------+
 double FindStructuralSL(double entryPrice, int direction)
 {
-   double bestSL = 0;
-   double padding = InpSLPaddingPts * _Point;
-   double maxDist = InpMaxSLPts * _Point;
+   double padding = InpSLPadding;
 
    if(InpSLMode == SL_FIXED)
    {
       if(direction > 0)
-         return entryPrice - InpSLFallbackPts * _Point;
+         return NormalizeDouble(entryPrice - InpSLFallback, _Digits);
       else
-         return entryPrice + InpSLFallbackPts * _Point;
+         return NormalizeDouble(entryPrice + InpSLFallback, _Digits);
    }
 
-   // Search current profile for structural levels
-   if(g_currentProfile.isValid)
-      bestSL = FindSLInProfile(g_currentProfile, entryPrice, direction, padding, maxDist);
+   // Collect candidates from each volume-based method
+   double slLVN  = 0;  // beyond next LVN opposite to trade
+   double slVA   = 0;  // beyond value area boundary
+   double slPOC  = 0;  // beyond prior session POC
 
-   // Search prior profiles if nothing found
-   if(bestSL == 0)
+   // --- Search current session profile ---
+   if(g_currentProfile.isValid)
    {
-      for(int d = 0; d < InpDaysBack; d++)
+      if(InpSLMode == SL_BEYOND_LVN || InpSLMode == SL_COMPOSITE)
+         slLVN = FindNextLVN(g_currentProfile, entryPrice, direction, padding);
+
+      if(InpSLMode == SL_BEYOND_VA || InpSLMode == SL_COMPOSITE)
+         slVA = FindVABoundarySL(g_currentProfile, entryPrice, direction, padding);
+   }
+
+   // --- Search prior session profiles ---
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+
+      if(InpSLMode == SL_BEYOND_LVN || InpSLMode == SL_COMPOSITE)
       {
-         if(!g_priorProfiles[d].isValid) continue;
-         double sl = FindSLInProfile(g_priorProfiles[d], entryPrice, direction, padding, maxDist);
-         if(sl != 0)
+         double lvn = FindNextLVN(g_priorProfiles[d], entryPrice, direction, padding);
+         if(lvn != 0 && IsFurtherSL(lvn, slLVN, entryPrice, direction))
+            slLVN = lvn;
+      }
+
+      if(InpSLMode == SL_BEYOND_VA || InpSLMode == SL_COMPOSITE)
+      {
+         double va = FindVABoundarySL(g_priorProfiles[d], entryPrice, direction, padding);
+         if(va != 0 && IsFurtherSL(va, slVA, entryPrice, direction))
+            slVA = va;
+      }
+
+      if(InpSLMode == SL_PRIOR_POC || InpSLMode == SL_COMPOSITE)
+      {
+         double poc = g_priorProfiles[d].pocPrice;
+         bool wrongSide = (direction > 0) ? (poc < entryPrice) : (poc > entryPrice);
+         if(wrongSide)
          {
-            if(bestSL == 0) { bestSL = sl; }
-            else if(direction > 0 && sl > bestSL) bestSL = sl;
-            else if(direction < 0 && sl < bestSL) bestSL = sl;
+            double candidate = (direction > 0) ? poc - padding : poc + padding;
+            if(slPOC == 0 || IsFurtherSL(candidate, slPOC, entryPrice, direction))
+               slPOC = candidate;
          }
       }
    }
 
+   // --- Pick the best SL based on mode ---
+   double bestSL = 0;
+
+   if(InpSLMode == SL_COMPOSITE)
+   {
+      // Composite: use whichever is FURTHEST from entry
+      if(slLVN != 0) bestSL = slLVN;
+      if(slVA != 0 && IsFurtherSL(slVA, bestSL, entryPrice, direction))
+         bestSL = slVA;
+      if(slPOC != 0 && IsFurtherSL(slPOC, bestSL, entryPrice, direction))
+         bestSL = slPOC;
+   }
+   else if(InpSLMode == SL_BEYOND_LVN)
+      bestSL = slLVN;
+   else if(InpSLMode == SL_BEYOND_VA)
+      bestSL = slVA;
+   else if(InpSLMode == SL_PRIOR_POC)
+      bestSL = slPOC;
+
+   // --- Fallback if no level found ---
    if(bestSL == 0)
    {
-      if(direction > 0) bestSL = entryPrice - InpSLFallbackPts * _Point;
-      else              bestSL = entryPrice + InpSLFallbackPts * _Point;
+      if(direction > 0) bestSL = entryPrice - InpSLFallback;
+      else              bestSL = entryPrice + InpSLFallback;
    }
 
+   // --- Enforce min/max distance ---
    double dist = MathAbs(entryPrice - bestSL);
-   if(dist > maxDist)
+
+   if(dist < InpMinSL)
    {
-      if(direction > 0) bestSL = entryPrice - maxDist;
-      else              bestSL = entryPrice + maxDist;
+      if(direction > 0) bestSL = entryPrice - InpMinSL;
+      else              bestSL = entryPrice + InpMinSL;
+   }
+   else if(dist > InpMaxSL)
+   {
+      if(direction > 0) bestSL = entryPrice - InpMaxSL;
+      else              bestSL = entryPrice + InpMaxSL;
    }
 
    return NormalizeDouble(bestSL, _Digits);
 }
 
-double FindSLInProfile(DailyProfile &profile, double entry, int dir,
-                        double padding, double maxDist)
+// Find the nearest LVN in the opposite direction to the trade
+double FindNextLVN(DailyProfile &profile, double entry, int dir, double padding)
 {
    double best = 0;
 
    for(int i = 0; i < profile.levelCount; i++)
    {
-      bool isStructural = false;
+      if(!profile.levels[i].isLVN) continue;
+      double p = profile.levels[i].price;
 
-      if(InpSLMode == SL_BELOW_HVN || InpSLMode == SL_STRUCTURAL)
-         if(profile.levels[i].isHVN || profile.levels[i].isPOC)
-            isStructural = true;
-
-      if(InpSLMode == SL_BEYOND_VA || InpSLMode == SL_STRUCTURAL)
-         if(MathAbs(profile.levels[i].price - profile.vahPrice) < InpPriceStep * 0.5 ||
-            MathAbs(profile.levels[i].price - profile.valPrice) < InpPriceStep * 0.5)
-            isStructural = true;
-
-      if(!isStructural) continue;
-
-      double lvlPrice = profile.levels[i].price;
-
-      if(dir > 0 && lvlPrice < entry)
+      if(dir > 0 && p < entry - InpPriceStep)
       {
-         double slCandidate = lvlPrice - padding;
-         if(entry - slCandidate <= maxDist)
-         {
-            if(best == 0 || slCandidate > best)
-               best = slCandidate;
-         }
+         double candidate = p - padding;
+         if(best == 0 || candidate > best)
+            best = candidate;
       }
-      else if(dir < 0 && lvlPrice > entry)
+      else if(dir < 0 && p > entry + InpPriceStep)
       {
-         double slCandidate = lvlPrice + padding;
-         if(slCandidate - entry <= maxDist)
-         {
-            if(best == 0 || slCandidate < best)
-               best = slCandidate;
-         }
+         double candidate = p + padding;
+         if(best == 0 || candidate < best)
+            best = candidate;
       }
    }
-
    return best;
+}
+
+// Find SL beyond the value area boundary
+double FindVABoundarySL(DailyProfile &profile, double entry, int dir, double padding)
+{
+   if(dir > 0 && profile.valPrice < entry)
+      return profile.valPrice - padding;
+   if(dir < 0 && profile.vahPrice > entry)
+      return profile.vahPrice + padding;
+   return 0;
+}
+
+// Returns true if candidate is further from entry than current best
+bool IsFurtherSL(double candidate, double current, double entry, int dir)
+{
+   if(current == 0) return true;
+   double candDist = MathAbs(entry - candidate);
+   double currDist = MathAbs(entry - current);
+   return candDist > currDist;
 }
 
 //+------------------------------------------------------------------+
@@ -1184,8 +1238,8 @@ void FindTargetTP(double entryPrice, int direction,
 
    if(InpTPMode == TP_FIXED)
    {
-      if(direction > 0) tp1Out = entryPrice + InpTPFallbackPts * _Point;
-      else              tp1Out = entryPrice - InpTPFallbackPts * _Point;
+      if(direction > 0) tp1Out = entryPrice + InpTPFallback;
+      else              tp1Out = entryPrice - InpTPFallback;
       return;
    }
 
@@ -1239,8 +1293,8 @@ void FindTargetTP(double entryPrice, int direction,
    // Fallbacks
    if(tp1Out == 0)
    {
-      if(direction > 0) tp1Out = entryPrice + InpTPFallbackPts * _Point;
-      else              tp1Out = entryPrice - InpTPFallbackPts * _Point;
+      if(direction > 0) tp1Out = entryPrice + InpTPFallback;
+      else              tp1Out = entryPrice - InpTPFallback;
    }
 
    tp1Out = NormalizeDouble(tp1Out, _Digits);
@@ -1331,7 +1385,7 @@ void ManageTrailingStop()
    double posPrice  = PositionGetDouble(POSITION_PRICE_OPEN);
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-   double padding = InpTrailPaddingPts * _Point;
+   double padding = InpTrailPadding;
 
    double newSL = currentSL;
 

@@ -1454,15 +1454,23 @@ void CheckSignals()
    // --- Calculate dynamic SL/TP ---
    double entryPrice = (tradeDir > 0) ? ask : bid;
    double sl = FindStructuralSL(entryPrice, tradeDir);
-   double slDist = MathAbs(entryPrice - sl);
-
    double tp1 = 0, tp2 = 0;
    FindTargetTP(entryPrice, tradeDir, tp1, tp2);
 
-   // Require reward >= risk
+   // Enforce broker minimum stop distance
+   double minStopDist = GetMinStopDistance();
+   sl  = EnforceMinDistance(entryPrice, sl, tradeDir, true, minStopDist);
+   tp1 = EnforceMinDistance(entryPrice, tp1, tradeDir, false, minStopDist);
+   if(tp2 != 0)
+      tp2 = EnforceMinDistance(entryPrice, tp2, tradeDir, false, minStopDist);
+
+   double slDist  = MathAbs(entryPrice - sl);
    double tp1Dist = MathAbs(tp1 - entryPrice);
+
+   // Require reward >= risk
    if(tp1Dist < slDist * 0.9)
    {
+      RecordTradedZone(mid, now);
       Print("Skipping: R:R too low. TP1=", tp1Dist / _Point,
             " pts vs SL=", slDist / _Point, " pts");
       return;
@@ -1475,6 +1483,8 @@ void CheckSignals()
                      " s" + IntegerToString(score);
 
    // --- Execute ---
+   RecordTradedZone(mid, now);
+
    bool success = false;
    if(tradeDir > 0)
       success = g_trade.Buy(lots, _Symbol, ask, sl, tp1, comment);
@@ -1490,8 +1500,6 @@ void CheckSignals()
       g_lastTrailPrice = entryPrice;
       g_tradesToday++;
 
-      RecordTradedZone(mid, now);
-
       Print((tradeDir > 0 ? "LONG" : "SHORT"),
             " | Score: ", score,
             " | Entry: ", entryPrice,
@@ -1501,6 +1509,54 @@ void CheckSignals()
             " | DeltaROC: ", DoubleToString(GetDeltaROC(now), 1),
             " | Lots: ", lots);
    }
+}
+
+//+------------------------------------------------------------------+
+//| Stop distance validation                                        |
+//+------------------------------------------------------------------+
+double GetMinStopDistance()
+{
+   long stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL);
+   double minDist = stopsLevel * _Point;
+
+   long freezeLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_FREEZE_LEVEL);
+   double freezeDist = freezeLevel * _Point;
+
+   double spread = SymbolInfoDouble(_Symbol, SYMBOL_ASK) - SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   double result = MathMax(minDist, spread * 2.0);
+   result = MathMax(result, freezeDist);
+
+   if(result <= 0)
+      result = 20 * _Point;
+
+   return result;
+}
+
+double EnforceMinDistance(double entry, double stopPrice, int dir,
+                          bool isSL, double minDist)
+{
+   double dist = MathAbs(entry - stopPrice);
+
+   if(dist < minDist)
+   {
+      if(isSL)
+      {
+         if(dir > 0) stopPrice = entry - minDist;
+         else        stopPrice = entry + minDist;
+      }
+      else
+      {
+         if(dir > 0) stopPrice = entry + minDist;
+         else        stopPrice = entry - minDist;
+      }
+   }
+
+   double tickSize = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+   if(tickSize > 0)
+      stopPrice = MathRound(stopPrice / tickSize) * tickSize;
+
+   return NormalizeDouble(stopPrice, _Digits);
 }
 
 //+------------------------------------------------------------------+

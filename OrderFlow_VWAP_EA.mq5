@@ -247,7 +247,7 @@ bool ShouldUseTickFlags()
 
    for(int i = 0; i < copied; i++)
    {
-      if((ticks[i].flags & TICK_FLAG_BUY) || (ticks[i].flags & TICK_FLAG_SELL))
+      if((ticks[i].flags & TICK_FLAG_BUY) != 0 || (ticks[i].flags & TICK_FLAG_SELL) != 0)
          return true;
    }
    return false;
@@ -393,8 +393,8 @@ int ClassifyTick(const MqlTick &tick, double prevMid, double curMid)
 {
    if(g_useTickFlags)
    {
-      if(tick.flags & TICK_FLAG_BUY)  return 1;
-      if(tick.flags & TICK_FLAG_SELL) return -1;
+      if((tick.flags & TICK_FLAG_BUY) != 0)  return 1;
+      if((tick.flags & TICK_FLAG_SELL) != 0) return -1;
    }
 
    if(curMid > prevMid) return 1;

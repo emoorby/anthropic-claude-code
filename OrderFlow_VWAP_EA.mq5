@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.00"
+#property version   "2.10"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2: Confluence scoring, dynamic SL/TP, trailing stop"
+#property description "v2.1: Signal log CSV, ATR breakeven, min TP/RR"
 
 #include <Trade\Trade.mqh>
 
@@ -106,6 +106,16 @@ input group "=== Trailing Stop ==="
 input bool           InpUseTrailing      = true;        // Trail Stop to Cleared HVNs
 input double         InpTrailPadding     = 2.0;         // Trail Padding Beyond HVN (price units)
 
+input group "=== Breakeven ==="
+input bool           InpUseBE            = true;        // Enable ATR Breakeven
+input int            InpBE_ATR_Period    = 10;          // ATR Period
+input double         InpBE_ATR_Multi     = 1.0;         // ATR Multiplier (move BE when price travels this x ATR)
+input double         InpBE_Offset        = 1.0;         // BE Offset (price units, 0 = exact entry)
+
+input group "=== Signal Log ==="
+input bool           InpSignalLog        = true;        // Log Every Signal Evaluation to CSV
+input string         InpSignalLogFolder  = "OrderFlow"; // Signal Log Subfolder
+
 input group "=== Cooldown ==="
 input int            InpCooldownSeconds  = 300;         // Seconds Before Re-entry at Same Zone
 input double         InpCooldownZoneSize = 3.0;         // Zone Size (price steps)
@@ -182,6 +192,14 @@ int            g_managedDir;       // 1=long, -1=short
 double         g_tp2Price;
 bool           g_tp1Hit;
 double         g_lastTrailPrice;
+bool           g_beApplied;
+
+// ATR handle
+int            g_atrHandle;
+
+// Signal log
+int            g_signalLogHandle;
+bool           g_signalLogHeaderWritten;
 
 //+------------------------------------------------------------------+
 int OnInit()
@@ -220,6 +238,22 @@ int OnInit()
    g_tp2Price       = 0;
    g_tp1Hit         = false;
    g_lastTrailPrice = 0;
+   g_beApplied      = false;
+
+   // ATR indicator
+   g_atrHandle = INVALID_HANDLE;
+   if(InpUseBE)
+   {
+      g_atrHandle = iATR(_Symbol, PERIOD_CURRENT, InpBE_ATR_Period);
+      if(g_atrHandle == INVALID_HANDLE)
+         Print("Warning: failed to create ATR indicator");
+   }
+
+   // Signal log file
+   g_signalLogHandle = INVALID_HANDLE;
+   g_signalLogHeaderWritten = false;
+   if(InpSignalLog)
+      OpenSignalLog();
 
    EventSetMillisecondTimer(3000);
 
@@ -234,6 +268,10 @@ void OnDeinit(const int reason)
 {
    EventKillTimer();
    RemoveAllObjects();
+   if(g_atrHandle != INVALID_HANDLE)
+      IndicatorRelease(g_atrHandle);
+   if(g_signalLogHandle != INVALID_HANDLE)
+      FileClose(g_signalLogHandle);
 }
 
 //+------------------------------------------------------------------+
@@ -245,6 +283,9 @@ void OnTick()
    if(now < g_todaySessionStart || now > g_todaySessionEnd) return;
 
    if(!g_currentProfile.isValid) return;
+
+   if(InpUseBE && g_managedTicket > 0 && !g_beApplied)
+      CheckBreakeven();
 
    if(InpUseTrailing && g_managedTicket > 0)
       ManageTrailingStop();
@@ -1520,9 +1561,13 @@ void CheckSignals()
 
    if(IsInCooldown(mid, now)) return;
 
-   // --- Score both directions ---
-   int longScore  = GetConfluenceScore(mid, 1);
-   int shortScore = GetConfluenceScore(mid, -1);
+   // --- Score both directions with breakdown ---
+   int lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol;
+   int sVwap, sHvn, sPPoc, sPVa, sPHvn, sDelta, sRoc, sVol;
+   int longScore  = GetConfluenceScoreDetailed(mid, 1,
+                       lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol);
+   int shortScore = GetConfluenceScoreDetailed(mid, -1,
+                       sVwap, sHvn, sPPoc, sPVa, sPHvn, sDelta, sRoc, sVol);
 
    // --- Determine best direction if either qualifies ---
    int tradeDir = 0;
@@ -1532,9 +1577,32 @@ void CheckSignals()
    else if(shortScore >= InpMinScore && shortScore > longScore)
       tradeDir = -1;
    else if(longScore >= InpMinScore && longScore == shortScore)
-      return; // conflicting — skip
+   {
+      if(InpSignalLog)
+         LogSignalEvaluation(now, mid, 1,
+            lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol,
+            longScore, 0, 0, 0, "SKIP", "conflicting_scores");
+      return;
+   }
 
-   if(tradeDir == 0) return;
+   if(tradeDir == 0)
+   {
+      int bestDir = (longScore >= shortScore) ? 1 : -1;
+      int bestScore = (bestDir > 0) ? longScore : shortScore;
+      if(InpSignalLog && bestScore >= 2)
+         LogSignalEvaluation(now, mid, bestDir,
+            (bestDir > 0 ? lVwap : sVwap), (bestDir > 0 ? lHvn : sHvn),
+            (bestDir > 0 ? lPPoc : sPPoc), (bestDir > 0 ? lPVa : sPVa),
+            (bestDir > 0 ? lPHvn : sPHvn), (bestDir > 0 ? lDelta : sDelta),
+            (bestDir > 0 ? lRoc : sRoc), (bestDir > 0 ? lVol : sVol),
+            bestScore, 0, 0, 0, "SKIP", "score_below_min");
+      return;
+   }
+
+   // Pick the winning direction's breakdown
+   int wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol;
+   if(tradeDir > 0) { wVwap=lVwap; wHvn=lHvn; wPPoc=lPPoc; wPVa=lPVa; wPHvn=lPHvn; wDelta=lDelta; wRoc=lRoc; wVol=lVol; }
+   else              { wVwap=sVwap; wHvn=sHvn; wPPoc=sPPoc; wPVa=sPVa; wPHvn=sPHvn; wDelta=sDelta; wRoc=sRoc; wVol=sVol; }
 
    // --- Calculate dynamic SL/TP ---
    double entryPrice = (tradeDir > 0) ? ask : bid;
@@ -1556,6 +1624,11 @@ void CheckSignals()
    if(tp1Dist < slDist * InpMinRR)
    {
       RecordTradedZone(mid, now);
+      if(InpSignalLog)
+         LogSignalEvaluation(now, mid, tradeDir,
+            wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
+            (tradeDir > 0 ? longScore : shortScore),
+            sl, tp1, tp2, "SKIP", "RR_too_low");
       Print("Skipping: R:R too low. TP1=", tp1Dist / _Point,
             " pts vs SL=", slDist / _Point, " pts");
       return;
@@ -1583,7 +1656,13 @@ void CheckSignals()
       g_tp2Price      = tp2;
       g_tp1Hit        = (InpTPMode != TP_MULTI_TARGET || tp2 == 0);
       g_lastTrailPrice = entryPrice;
+      g_beApplied     = false;
       g_tradesToday++;
+
+      if(InpSignalLog)
+         LogSignalEvaluation(now, mid, tradeDir,
+            wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
+            score, sl, tp1, tp2, "TRADE", "");
 
       Print((tradeDir > 0 ? "LONG" : "SHORT"),
             " | Score: ", score,
@@ -1593,6 +1672,13 @@ void CheckSignals()
             " | TP2: ", (tp2 > 0 ? DoubleToString(tp2, _Digits) : "none"),
             " | DeltaROC: ", DoubleToString(GetDeltaROC(now), 1),
             " | Lots: ", lots);
+   }
+   else
+   {
+      if(InpSignalLog)
+         LogSignalEvaluation(now, mid, tradeDir,
+            wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
+            score, sl, tp1, tp2, "FAIL", "order_failed");
    }
 }
 
@@ -1642,6 +1728,182 @@ double EnforceMinDistance(double entry, double stopPrice, int dir,
       stopPrice = MathRound(stopPrice / tickSize) * tickSize;
 
    return NormalizeDouble(stopPrice, _Digits);
+}
+
+//+------------------------------------------------------------------+
+//| ATR Breakeven                                                    |
+//+------------------------------------------------------------------+
+void CheckBreakeven()
+{
+   if(g_atrHandle == INVALID_HANDLE) return;
+   if(!PositionSelectByTicket(g_managedTicket)) return;
+
+   double atr[];
+   if(CopyBuffer(g_atrHandle, 0, 0, 1, atr) < 1) return;
+
+   double atrVal   = atr[0];
+   double trigger  = atrVal * InpBE_ATR_Multi;
+   double posPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+   double curSL    = PositionGetDouble(POSITION_SL);
+   double curTP    = PositionGetDouble(POSITION_TP);
+   double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   double newSL;
+
+   if(g_managedDir > 0)
+   {
+      if(bid - posPrice < trigger) return;
+      newSL = posPrice + InpBE_Offset;
+      if(newSL <= curSL) return;
+      if(newSL >= bid) return;
+   }
+   else
+   {
+      if(posPrice - ask < trigger) return;
+      newSL = posPrice - InpBE_Offset;
+      if(curSL != 0 && newSL >= curSL) return;
+      if(newSL <= ask) return;
+   }
+
+   newSL = NormalizeDouble(newSL, _Digits);
+   if(g_trade.PositionModify(g_managedTicket, newSL, curTP))
+   {
+      g_beApplied = true;
+      Print("Breakeven applied. SL moved to ", newSL,
+            " (ATR=", DoubleToString(atrVal, _Digits),
+            ", trigger=", DoubleToString(trigger, _Digits), ")");
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Signal Log                                                       |
+//+------------------------------------------------------------------+
+void OpenSignalLog()
+{
+   string filename = InpSignalLogFolder + "\\SignalLog_" + _Symbol + ".csv";
+   g_signalLogHandle = FileOpen(filename, FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
+   if(g_signalLogHandle == INVALID_HANDLE)
+   {
+      Print("Warning: cannot open signal log: ", filename);
+      return;
+   }
+   FileWrite(g_signalLogHandle,
+      "Time", "Price", "Direction",
+      "VWAP_Align", "At_HVN_POC", "Prior_POC", "Prior_VA", "Prior_HVN",
+      "Delta_Favor", "Delta_ROC", "Vol_Above_Avg",
+      "Total_Score", "Min_Score",
+      "SL", "SL_Dist", "TP1", "TP1_Dist", "TP2",
+      "RR_Ratio",
+      "Outcome", "Reject_Reason");
+   g_signalLogHeaderWritten = true;
+}
+
+void LogSignalEvaluation(datetime time, double price, int direction,
+                          int vwap, int atHvn, int priorPoc, int priorVa, int priorHvn,
+                          int deltaFav, int deltaRoc, int volAbove,
+                          int totalScore,
+                          double sl, double tp1, double tp2,
+                          string outcome, string rejectReason)
+{
+   if(g_signalLogHandle == INVALID_HANDLE) return;
+
+   double slDist  = (sl > 0)  ? MathAbs(price - sl) : 0;
+   double tp1Dist = (tp1 > 0) ? MathAbs(tp1 - price) : 0;
+   double rr      = (slDist > 0 && tp1Dist > 0) ? tp1Dist / slDist : 0;
+
+   FileWrite(g_signalLogHandle,
+      TimeToString(time, TIME_DATE | TIME_SECONDS),
+      DoubleToString(price, _Digits),
+      (direction > 0 ? "LONG" : "SHORT"),
+      IntegerToString(vwap),
+      IntegerToString(atHvn),
+      IntegerToString(priorPoc),
+      IntegerToString(priorVa),
+      IntegerToString(priorHvn),
+      IntegerToString(deltaFav),
+      IntegerToString(deltaRoc),
+      IntegerToString(volAbove),
+      IntegerToString(totalScore),
+      IntegerToString(InpMinScore),
+      (sl > 0  ? DoubleToString(sl, _Digits) : ""),
+      DoubleToString(slDist, 2),
+      (tp1 > 0 ? DoubleToString(tp1, _Digits) : ""),
+      DoubleToString(tp1Dist, 2),
+      (tp2 > 0 ? DoubleToString(tp2, _Digits) : ""),
+      DoubleToString(rr, 2),
+      outcome,
+      rejectReason);
+   FileFlush(g_signalLogHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Confluence scoring with individual factor breakdown               |
+//+------------------------------------------------------------------+
+int GetConfluenceScoreDetailed(double price, int direction,
+                                int &outVwap, int &outAtHvn, int &outPriorPoc,
+                                int &outPriorVa, int &outPriorHvn,
+                                int &outDeltaFav, int &outDeltaRoc, int &outVolAbove)
+{
+   int score = 0;
+   datetime now = TimeCurrent();
+   outVwap = outAtHvn = outPriorPoc = outPriorVa = outPriorHvn = 0;
+   outDeltaFav = outDeltaRoc = outVolAbove = 0;
+
+   if(direction > 0 && price <= g_vwap) { score++; outVwap = 1; }
+   if(direction < 0 && price >= g_vwap) { score++; outVwap = 1; }
+
+   int lvl = FindNearestLevel(g_currentProfile, price);
+   if(lvl >= 0)
+   {
+      if(g_currentProfile.levels[lvl].isHVN ||
+         g_currentProfile.levels[lvl].isPOC)
+      { score++; outAtHvn = 1; }
+   }
+
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
+      if(dist <= 2.0) { score += 2; outPriorPoc = 2; break; }
+   }
+
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      if(direction > 0)
+      {
+         double dist = MathAbs(price - g_priorProfiles[d].valPrice) / InpPriceStep;
+         if(dist <= 2.0) { score++; outPriorVa = 1; break; }
+      }
+      else
+      {
+         double dist = MathAbs(price - g_priorProfiles[d].vahPrice) / InpPriceStep;
+         if(dist <= 2.0) { score++; outPriorVa = 1; break; }
+      }
+   }
+
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      for(int i = 0; i < g_priorProfiles[d].levelCount; i++)
+      {
+         if(!g_priorProfiles[d].levels[i].isHVN) continue;
+         double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
+         if(dist <= 2.0) { score++; outPriorHvn = 1; d = InpDaysBack; break; }
+      }
+   }
+
+   if(direction > 0 && g_cumDelta > 0) { score++; outDeltaFav = 1; }
+   if(direction < 0 && g_cumDelta < 0) { score++; outDeltaFav = 1; }
+
+   double roc = GetDeltaROC(now);
+   if(direction > 0 && roc >= InpDeltaRocMin)  { score++; outDeltaRoc = 1; }
+   if(direction < 0 && roc <= -InpDeltaRocMin) { score++; outDeltaRoc = 1; }
+
+   if(IsVolumeAboveAverage()) { score++; outVolAbove = 1; }
+
+   return score;
 }
 
 //+------------------------------------------------------------------+

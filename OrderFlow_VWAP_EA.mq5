@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.20"
+#property version   "2.30"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2.2: Fix dead factors, append log, trades-only mode"
+#property description "v2.3: VWAP/DeltaROC as prereqs, Vol fix, overtrading guards"
 
 #include <Trade\Trade.mqh>
 
@@ -77,7 +77,9 @@ input double         InpRiskPercent      = 0.0;         // Risk % (0=fixed lot)
 input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Session
 
 input group "=== Confluence Scoring ==="
-input int            InpMinScore         = 4;           // Min Score to Enter (max ~9)
+input int            InpMinScore         = 4;           // Min Score to Enter (max ~7)
+input bool           InpVwapPrereq       = true;        // VWAP Alignment Required (not scored)
+input bool           InpDeltaRocPrereq   = true;        // Delta ROC Required (not scored)
 input double         InpProximitySteps   = 10.0;        // Proximity for Prior Levels (price steps)
 input int            InpDeltaRocSeconds  = 30;          // Delta ROC Lookback (seconds)
 input double         InpDeltaRocMin      = 5.0;         // Min Delta ROC for +1 Score
@@ -119,7 +121,7 @@ input bool           InpLogTradesOnly    = true;        // Log Only Executed Tra
 input string         InpSignalLogFolder  = "OrderFlow"; // Signal Log Subfolder
 
 input group "=== Cooldown ==="
-input int            InpCooldownSeconds  = 300;         // Seconds Before Re-entry at Same Zone
+input int            InpCooldownSeconds  = 600;         // Seconds Before Re-entry at Same Zone
 input double         InpCooldownZoneSize = 3.0;         // Zone Size (price steps)
 
 //--- Structures
@@ -1033,8 +1035,9 @@ bool IsWithinActiveWindow(datetime now)
 //+------------------------------------------------------------------+
 bool IsVolumeAboveAverage()
 {
+   // Method 1: Compare current M5 bar volume to recent M5 bar average
    long volumes[];
-   int bars = CopyTickVolume(_Symbol, PERIOD_M1, 0, 30, volumes);
+   int bars = CopyTickVolume(_Symbol, PERIOD_M5, 0, 30, volumes);
 
    if(bars >= 5)
    {
@@ -1046,6 +1049,36 @@ bool IsVolumeAboveAverage()
          return ((double)volumes[0] / avg) >= InpMinBarVolRatio;
    }
 
+   // Method 2: Compare current bar's volume to same-timeframe prior-day averages
+   if(g_currentProfile.isValid && g_currentProfile.levelCount > 0)
+   {
+      double curBarVol = 0;
+      long vol1[];
+      if(CopyTickVolume(_Symbol, PERIOD_M1, 0, 1, vol1) >= 1)
+         curBarVol = (double)vol1[0];
+
+      if(curBarVol > 0)
+      {
+         double priorBarAvg = 0;
+         int validDays = 0;
+         for(int d = 0; d < InpDaysBack; d++)
+         {
+            if(!g_priorProfiles[d].isValid) continue;
+            if(g_priorProfiles[d].levelCount <= 0) continue;
+            double dayAvg = g_priorProfiles[d].totalVolume / g_priorProfiles[d].levelCount;
+            priorBarAvg += dayAvg;
+            validDays++;
+         }
+         if(validDays > 0)
+         {
+            priorBarAvg /= validDays;
+            if(priorBarAvg > 0)
+               return (curBarVol / priorBarAvg) >= InpMinBarVolRatio;
+         }
+      }
+   }
+
+   // Method 3: Session volume pace vs prior-day average pace
    if(!g_currentProfile.isValid || g_currentProfile.totalVolume <= 0)
       return false;
 
@@ -1076,9 +1109,14 @@ int GetConfluenceScore(double price, int direction)
    int score = 0;
    datetime now = TimeCurrent();
 
-   // 1. VWAP alignment (+1)
-   if(direction > 0 && price <= g_vwap) score++;
-   if(direction < 0 && price >= g_vwap) score++;
+   // 1. VWAP alignment — prerequisite when InpVwapPrereq, otherwise +1
+   bool vwapOk = (direction > 0 && price <= g_vwap) ||
+                 (direction < 0 && price >= g_vwap);
+   if(InpVwapPrereq)
+   {
+      if(!vwapOk) return -1;
+   }
+   else if(vwapOk) score++;
 
    // 2. At current session HVN or POC (+1)
    int lvl = FindNearestLevel(g_currentProfile, price);
@@ -1133,10 +1171,15 @@ int GetConfluenceScore(double price, int direction)
    if(direction > 0 && g_cumDelta > 0) score++;
    if(direction < 0 && g_cumDelta < 0) score++;
 
-   // 7. Delta ROC accelerating in trade direction (+1)
+   // 7. Delta ROC — prerequisite when InpDeltaRocPrereq, otherwise +1
    double roc = GetDeltaROC(now);
-   if(direction > 0 && roc >= InpDeltaRocMin) score++;
-   if(direction < 0 && roc <= -InpDeltaRocMin) score++;
+   bool rocOk = (direction > 0 && roc >= InpDeltaRocMin) ||
+                (direction < 0 && roc <= -InpDeltaRocMin);
+   if(InpDeltaRocPrereq)
+   {
+      if(!rocOk) return -1;
+   }
+   else if(rocOk) score++;
 
    // 8. Volume above average (+1)
    if(IsVolumeAboveAverage()) score++;
@@ -1586,6 +1629,7 @@ void CheckSignals()
    if(IsInCooldown(mid, now)) return;
 
    // --- Score both directions with breakdown ---
+   // Returns -1 when a prerequisite (VWAP/DeltaROC) fails
    int lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol;
    int sVwap, sHvn, sPPoc, sPVa, sPHvn, sDelta, sRoc, sVol;
    int longScore  = GetConfluenceScoreDetailed(mid, 1,
@@ -1593,12 +1637,22 @@ void CheckSignals()
    int shortScore = GetConfluenceScoreDetailed(mid, -1,
                        sVwap, sHvn, sPPoc, sPVa, sPHvn, sDelta, sRoc, sVol);
 
+   // Prerequisites failed for both directions
+   if(longScore < 0 && shortScore < 0)
+   {
+      if(InpSignalLog && !InpLogTradesOnly)
+         LogSignalEvaluation(now, mid, 1,
+            lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol,
+            0, 0, 0, 0, "SKIP", "prereq_failed");
+      return;
+   }
+
    // --- Determine best direction if either qualifies ---
    int tradeDir = 0;
 
-   if(longScore >= InpMinScore && longScore > shortScore)
+   if(longScore >= InpMinScore && (shortScore < 0 || longScore > shortScore))
       tradeDir = 1;
-   else if(shortScore >= InpMinScore && shortScore > longScore)
+   else if(shortScore >= InpMinScore && (longScore < 0 || shortScore > longScore))
       tradeDir = -1;
    else if(longScore >= InpMinScore && longScore == shortScore)
    {
@@ -1885,8 +1939,15 @@ int GetConfluenceScoreDetailed(double price, int direction,
    outVwap = outAtHvn = outPriorPoc = outPriorVa = outPriorHvn = 0;
    outDeltaFav = outDeltaRoc = outVolAbove = 0;
 
-   if(direction > 0 && price <= g_vwap) { score++; outVwap = 1; }
-   if(direction < 0 && price >= g_vwap) { score++; outVwap = 1; }
+   // 1. VWAP alignment — prerequisite or +1
+   bool vwapOk = (direction > 0 && price <= g_vwap) ||
+                 (direction < 0 && price >= g_vwap);
+   if(vwapOk) outVwap = 1;
+   if(InpVwapPrereq)
+   {
+      if(!vwapOk) return -1;
+   }
+   else if(vwapOk) score++;
 
    int lvl = FindNearestLevel(g_currentProfile, price);
    if(lvl >= 0)
@@ -1932,9 +1993,16 @@ int GetConfluenceScoreDetailed(double price, int direction,
    if(direction > 0 && g_cumDelta > 0) { score++; outDeltaFav = 1; }
    if(direction < 0 && g_cumDelta < 0) { score++; outDeltaFav = 1; }
 
+   // 7. Delta ROC — prerequisite or +1
    double roc = GetDeltaROC(now);
-   if(direction > 0 && roc >= InpDeltaRocMin)  { score++; outDeltaRoc = 1; }
-   if(direction < 0 && roc <= -InpDeltaRocMin) { score++; outDeltaRoc = 1; }
+   bool rocOk = (direction > 0 && roc >= InpDeltaRocMin) ||
+                (direction < 0 && roc <= -InpDeltaRocMin);
+   if(rocOk) outDeltaRoc = 1;
+   if(InpDeltaRocPrereq)
+   {
+      if(!rocOk) return -1;
+   }
+   else if(rocOk) score++;
 
    if(IsVolumeAboveAverage()) { score++; outVolAbove = 1; }
 

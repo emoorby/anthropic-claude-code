@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.10"
+#property version   "2.20"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2.1: Signal log CSV, ATR breakeven, min TP/RR"
+#property description "v2.2: Fix dead factors, append log, trades-only mode"
 
 #include <Trade\Trade.mqh>
 
@@ -78,6 +78,7 @@ input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Sessio
 
 input group "=== Confluence Scoring ==="
 input int            InpMinScore         = 4;           // Min Score to Enter (max ~9)
+input double         InpProximitySteps   = 10.0;        // Proximity for Prior Levels (price steps)
 input int            InpDeltaRocSeconds  = 30;          // Delta ROC Lookback (seconds)
 input double         InpDeltaRocMin      = 5.0;         // Min Delta ROC for +1 Score
 input double         InpMinBarVolRatio   = 1.2;         // Min Volume Ratio vs Average
@@ -113,7 +114,8 @@ input double         InpBE_ATR_Multi     = 1.0;         // ATR Multiplier (move 
 input double         InpBE_Offset        = 1.0;         // BE Offset (price units, 0 = exact entry)
 
 input group "=== Signal Log ==="
-input bool           InpSignalLog        = true;        // Log Every Signal Evaluation to CSV
+input bool           InpSignalLog        = true;        // Log Signals to CSV
+input bool           InpLogTradesOnly    = true;        // Log Only Executed Trades (vs all evals)
 input string         InpSignalLogFolder  = "OrderFlow"; // Signal Log Subfolder
 
 input group "=== Cooldown ==="
@@ -1033,15 +1035,37 @@ bool IsVolumeAboveAverage()
 {
    long volumes[];
    int bars = CopyTickVolume(_Symbol, PERIOD_M1, 0, 30, volumes);
-   if(bars < 5) return true;
 
-   double avg = 0;
-   for(int i = 1; i < bars; i++)
-      avg += (double)volumes[i];
-   avg /= (bars - 1);
+   if(bars >= 5)
+   {
+      double avg = 0;
+      for(int i = 1; i < bars; i++)
+         avg += (double)volumes[i];
+      avg /= (bars - 1);
+      if(avg > 0)
+         return ((double)volumes[0] / avg) >= InpMinBarVolRatio;
+   }
 
-   if(avg <= 0) return true;
-   return ((double)volumes[0] / avg) >= InpMinBarVolRatio;
+   if(!g_currentProfile.isValid || g_currentProfile.totalVolume <= 0)
+      return false;
+
+   double priorAvg = 0;
+   int validDays = 0;
+   for(int d = 0; d < InpDaysBack; d++)
+   {
+      if(!g_priorProfiles[d].isValid) continue;
+      priorAvg += g_priorProfiles[d].totalVolume;
+      validDays++;
+   }
+   if(validDays == 0) return false;
+   priorAvg /= validDays;
+
+   double elapsed = (double)(TimeCurrent() - g_todaySessionStart);
+   double sessionLen = (double)(g_todaySessionEnd - g_todaySessionStart);
+   if(sessionLen <= 0 || elapsed <= 0) return false;
+   double paceRatio = (g_currentProfile.totalVolume / elapsed) /
+                      (priorAvg / sessionLen);
+   return paceRatio >= InpMinBarVolRatio;
 }
 
 //+------------------------------------------------------------------+
@@ -1070,7 +1094,7 @@ int GetConfluenceScore(double price, int direction)
    {
       if(!g_priorProfiles[d].isValid) continue;
       double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
-      if(dist <= 2.0)
+      if(dist <= InpProximitySteps)
       {
          score += 2;
          break;
@@ -1084,12 +1108,12 @@ int GetConfluenceScore(double price, int direction)
       if(direction > 0)
       {
          double dist = MathAbs(price - g_priorProfiles[d].valPrice) / InpPriceStep;
-         if(dist <= 2.0) { score++; break; }
+         if(dist <= InpProximitySteps) { score++; break; }
       }
       else
       {
          double dist = MathAbs(price - g_priorProfiles[d].vahPrice) / InpPriceStep;
-         if(dist <= 2.0) { score++; break; }
+         if(dist <= InpProximitySteps) { score++; break; }
       }
    }
 
@@ -1101,7 +1125,7 @@ int GetConfluenceScore(double price, int direction)
       {
          if(!g_priorProfiles[d].levels[i].isHVN) continue;
          double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
-         if(dist <= 2.0) { score++; d = InpDaysBack; break; }
+         if(dist <= InpProximitySteps) { score++; d = InpDaysBack; break; }
       }
    }
 
@@ -1578,7 +1602,7 @@ void CheckSignals()
       tradeDir = -1;
    else if(longScore >= InpMinScore && longScore == shortScore)
    {
-      if(InpSignalLog)
+      if(InpSignalLog && !InpLogTradesOnly)
          LogSignalEvaluation(now, mid, 1,
             lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol,
             longScore, 0, 0, 0, "SKIP", "conflicting_scores");
@@ -1589,7 +1613,7 @@ void CheckSignals()
    {
       int bestDir = (longScore >= shortScore) ? 1 : -1;
       int bestScore = (bestDir > 0) ? longScore : shortScore;
-      if(InpSignalLog && bestScore >= 2)
+      if(InpSignalLog && !InpLogTradesOnly && bestScore >= 2)
          LogSignalEvaluation(now, mid, bestDir,
             (bestDir > 0 ? lVwap : sVwap), (bestDir > 0 ? lHvn : sHvn),
             (bestDir > 0 ? lPPoc : sPPoc), (bestDir > 0 ? lPVa : sPVa),
@@ -1624,7 +1648,7 @@ void CheckSignals()
    if(tp1Dist < slDist * InpMinRR)
    {
       RecordTradedZone(mid, now);
-      if(InpSignalLog)
+      if(InpSignalLog && !InpLogTradesOnly)
          LogSignalEvaluation(now, mid, tradeDir,
             wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
             (tradeDir > 0 ? longScore : shortScore),
@@ -1782,21 +1806,32 @@ void CheckBreakeven()
 void OpenSignalLog()
 {
    string filename = InpSignalLogFolder + "\\SignalLog_" + _Symbol + ".csv";
-   g_signalLogHandle = FileOpen(filename, FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
+
+   g_signalLogHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
    if(g_signalLogHandle == INVALID_HANDLE)
    {
       Print("Warning: cannot open signal log: ", filename);
       return;
    }
-   FileWrite(g_signalLogHandle,
-      "Time", "Price", "Direction",
-      "VWAP_Align", "At_HVN_POC", "Prior_POC", "Prior_VA", "Prior_HVN",
-      "Delta_Favor", "Delta_ROC", "Vol_Above_Avg",
-      "Total_Score", "Min_Score",
-      "SL", "SL_Dist", "TP1", "TP1_Dist", "TP2",
-      "RR_Ratio",
-      "Outcome", "Reject_Reason");
-   g_signalLogHeaderWritten = true;
+
+   long fileSize = FileSize(g_signalLogHandle);
+   if(fileSize > 0)
+   {
+      FileSeek(g_signalLogHandle, 0, SEEK_END);
+      g_signalLogHeaderWritten = true;
+   }
+   else
+   {
+      FileWrite(g_signalLogHandle,
+         "Time", "Price", "Direction",
+         "VWAP_Align", "At_HVN_POC", "Prior_POC", "Prior_VA", "Prior_HVN",
+         "Delta_Favor", "Delta_ROC", "Vol_Above_Avg",
+         "Total_Score", "Min_Score",
+         "SL", "SL_Dist", "TP1", "TP1_Dist", "TP2",
+         "RR_Ratio",
+         "Outcome", "Reject_Reason");
+      g_signalLogHeaderWritten = true;
+   }
 }
 
 void LogSignalEvaluation(datetime time, double price, int direction,
@@ -1865,7 +1900,7 @@ int GetConfluenceScoreDetailed(double price, int direction,
    {
       if(!g_priorProfiles[d].isValid) continue;
       double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
-      if(dist <= 2.0) { score += 2; outPriorPoc = 2; break; }
+      if(dist <= InpProximitySteps) { score += 2; outPriorPoc = 2; break; }
    }
 
    for(int d = 0; d < InpDaysBack; d++)
@@ -1874,12 +1909,12 @@ int GetConfluenceScoreDetailed(double price, int direction,
       if(direction > 0)
       {
          double dist = MathAbs(price - g_priorProfiles[d].valPrice) / InpPriceStep;
-         if(dist <= 2.0) { score++; outPriorVa = 1; break; }
+         if(dist <= InpProximitySteps) { score++; outPriorVa = 1; break; }
       }
       else
       {
          double dist = MathAbs(price - g_priorProfiles[d].vahPrice) / InpPriceStep;
-         if(dist <= 2.0) { score++; outPriorVa = 1; break; }
+         if(dist <= InpProximitySteps) { score++; outPriorVa = 1; break; }
       }
    }
 
@@ -1890,7 +1925,7 @@ int GetConfluenceScoreDetailed(double price, int direction,
       {
          if(!g_priorProfiles[d].levels[i].isHVN) continue;
          double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
-         if(dist <= 2.0) { score++; outPriorHvn = 1; d = InpDaysBack; break; }
+         if(dist <= InpProximitySteps) { score++; outPriorHvn = 1; d = InpDaysBack; break; }
       }
    }
 

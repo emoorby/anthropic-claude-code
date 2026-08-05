@@ -1814,7 +1814,7 @@ void OpenSignalLog()
       return;
    }
 
-   long fileSize = FileSize(g_signalLogHandle);
+   ulong fileSize = FileSize(g_signalLogHandle);
    if(fileSize > 0)
    {
       FileSeek(g_signalLogHandle, 0, SEEK_END);

@@ -1244,6 +1244,7 @@ double FindStructuralSL(double entryPrice, int direction)
    }
 
    // --- Search prior session profiles ---
+   // Keep the NEAREST candidate per method (closest structural support/resistance)
    for(int d = 0; d < InpDaysBack; d++)
    {
       if(!g_priorProfiles[d].isValid) continue;
@@ -1251,14 +1252,14 @@ double FindStructuralSL(double entryPrice, int direction)
       if(InpSLMode == SL_BEYOND_LVN || InpSLMode == SL_COMPOSITE)
       {
          double lvn = FindNextLVN(g_priorProfiles[d], entryPrice, direction, padding);
-         if(lvn != 0 && IsFurtherSL(lvn, slLVN, entryPrice, direction))
+         if(lvn != 0 && IsCloserSL(lvn, slLVN, entryPrice, direction))
             slLVN = lvn;
       }
 
       if(InpSLMode == SL_BEYOND_VA || InpSLMode == SL_COMPOSITE)
       {
          double va = FindVABoundarySL(g_priorProfiles[d], entryPrice, direction, padding);
-         if(va != 0 && IsFurtherSL(va, slVA, entryPrice, direction))
+         if(va != 0 && IsCloserSL(va, slVA, entryPrice, direction))
             slVA = va;
       }
 
@@ -1269,7 +1270,7 @@ double FindStructuralSL(double entryPrice, int direction)
          if(wrongSide)
          {
             double candidate = (direction > 0) ? poc - padding : poc + padding;
-            if(slPOC == 0 || IsFurtherSL(candidate, slPOC, entryPrice, direction))
+            if(slPOC == 0 || IsCloserSL(candidate, slPOC, entryPrice, direction))
                slPOC = candidate;
          }
       }
@@ -1280,7 +1281,8 @@ double FindStructuralSL(double entryPrice, int direction)
 
    if(InpSLMode == SL_COMPOSITE)
    {
-      // Composite: use whichever is FURTHEST from entry
+      // Composite: use whichever structural level is FURTHEST from entry
+      // (most protective — SL behind the strongest nearby structure)
       if(slLVN != 0) bestSL = slLVN;
       if(slVA != 0 && IsFurtherSL(slVA, bestSL, entryPrice, direction))
          bestSL = slVA;
@@ -1361,6 +1363,15 @@ bool IsFurtherSL(double candidate, double current, double entry, int dir)
    double candDist = MathAbs(entry - candidate);
    double currDist = MathAbs(entry - current);
    return candDist > currDist;
+}
+
+// Returns true if candidate is closer to entry than current best
+bool IsCloserSL(double candidate, double current, double entry, int dir)
+{
+   if(current == 0) return true;
+   double candDist = MathAbs(entry - candidate);
+   double currDist = MathAbs(entry - current);
+   return candDist < currDist;
 }
 
 //+------------------------------------------------------------------+

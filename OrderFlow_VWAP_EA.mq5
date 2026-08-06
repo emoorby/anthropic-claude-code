@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.50"
+#property version   "2.51"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2.5: HVN weight +2, trail fix, modified SL tracking"
+#property description "v2.51: Day-of-week and blocked-hour filters"
 
 #include <Trade\Trade.mqh>
 
@@ -91,6 +91,11 @@ input int            InpActiveStartHour  = 15;          // Active Window Start H
 input int            InpActiveStartMin   = 30;          // Active Window Start Minute
 input int            InpActiveEndHour    = 19;          // Active Window End Hour
 input int            InpActiveEndMin     = 0;           // Active Window End Minute
+
+input group "=== Day & Time Filters ==="
+input string         InpBlockedDays      = "1";         // Blocked Days (0=Sun,1=Mon..6=Sat, comma-sep)
+input int            InpBlockedHourStart = 15;           // Blocked Hour Start (-1 = off)
+input int            InpBlockedHourEnd   = 15;           // Blocked Hour End (inclusive, same = single hour)
 
 input group "=== Stop Loss ==="
 input ENUM_SL_MODE   InpSLMode           = SL_COMPOSITE; // SL Placement Mode
@@ -278,12 +283,15 @@ int OnInit()
 
    EventSetMillisecondTimer(3000);
 
-   Print("OrderFlow VWAP EA v2.5 initialized. Delta method: ",
+   Print("OrderFlow VWAP EA v2.51 initialized. Delta method: ",
          g_useTickFlags ? "Tick Flags" : "Tick Rule",
          " | Min score: ", InpMinScore,
          " | Prereqs: VWAP=", InpVwapPrereq,
          " ROC=", InpDeltaRocPrereq,
-         " HVN=", InpPriorHvnPrereq);
+         " HVN=", InpPriorHvnPrereq,
+         " | BlockedDays=", InpBlockedDays,
+         " BlockedHour=", InpBlockedHourStart < 0 ? "off" :
+            IntegerToString(InpBlockedHourStart) + "-" + IntegerToString(InpBlockedHourEnd));
    return(INIT_SUCCEEDED);
 }
 
@@ -1054,6 +1062,34 @@ bool IsWithinActiveWindow(datetime now)
 }
 
 //+------------------------------------------------------------------+
+//| Day-of-week and hour filters                                     |
+//+------------------------------------------------------------------+
+bool IsDayBlocked(datetime now)
+{
+   if(StringLen(InpBlockedDays) == 0) return false;
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   string parts[];
+   int n = StringSplit(InpBlockedDays, ',', parts);
+   for(int i = 0; i < n; i++)
+   {
+      StringTrimLeft(parts[i]);
+      StringTrimRight(parts[i]);
+      if((int)StringToInteger(parts[i]) == dt.day_of_week)
+         return true;
+   }
+   return false;
+}
+
+bool IsHourBlocked(datetime now)
+{
+   if(InpBlockedHourStart < 0) return false;
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   return (dt.hour >= InpBlockedHourStart && dt.hour <= InpBlockedHourEnd);
+}
+
+//+------------------------------------------------------------------+
 //| Volume confirmation (current bar vs recent average)              |
 //+------------------------------------------------------------------+
 bool IsVolumeAboveAverage()
@@ -1664,6 +1700,8 @@ void CheckSignals()
    // --- Pre-filters (fast rejection) ---
 
    if(!IsWithinActiveWindow(now)) return;
+   if(IsDayBlocked(now)) return;
+   if(IsHourBlocked(now)) return;
 
    if(InpGlobalCooldown > 0 && g_lastTradeTime > 0 &&
       (now - g_lastTradeTime) < InpGlobalCooldown) return;

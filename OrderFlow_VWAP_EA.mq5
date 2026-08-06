@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.30"
+#property version   "2.40"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2.3: VWAP/DeltaROC as prereqs, Vol fix, overtrading guards"
+#property description "v2.4: Win/loss tracking, PriorHVN prereq, global cooldown"
 
 #include <Trade\Trade.mqh>
 
@@ -77,9 +77,10 @@ input double         InpRiskPercent      = 0.0;         // Risk % (0=fixed lot)
 input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Session
 
 input group "=== Confluence Scoring ==="
-input int            InpMinScore         = 4;           // Min Score to Enter (max ~7)
+input int            InpMinScore         = 4;           // Min Score to Enter (max ~6)
 input bool           InpVwapPrereq       = true;        // VWAP Alignment Required (not scored)
 input bool           InpDeltaRocPrereq   = true;        // Delta ROC Required (not scored)
+input bool           InpPriorHvnPrereq   = true;        // Prior HVN Required (not scored)
 input double         InpProximitySteps   = 10.0;        // Proximity for Prior Levels (price steps)
 input int            InpDeltaRocSeconds  = 30;          // Delta ROC Lookback (seconds)
 input double         InpDeltaRocMin      = 5.0;         // Min Delta ROC for +1 Score
@@ -123,6 +124,7 @@ input string         InpSignalLogFolder  = "OrderFlow"; // Signal Log Subfolder
 input group "=== Cooldown ==="
 input int            InpCooldownSeconds  = 600;         // Seconds Before Re-entry at Same Zone
 input double         InpCooldownZoneSize = 3.0;         // Zone Size (price steps)
+input int            InpGlobalCooldown   = 600;         // Min Seconds Between Any Two Trades
 
 //--- Structures
 struct PriceLevel
@@ -197,6 +199,16 @@ double         g_tp2Price;
 bool           g_tp1Hit;
 double         g_lastTrailPrice;
 bool           g_beApplied;
+datetime       g_lastTradeTime;
+
+// Entry details for win/loss logging
+double         g_entryPrice;
+double         g_entrySL;
+double         g_entryTP1;
+double         g_entryTP2;
+int            g_entryScore;
+int            g_entryVwap, g_entryHvn, g_entryPPoc, g_entryPVa, g_entryPHvn;
+int            g_entryDelta, g_entryRoc, g_entryVol;
 
 // ATR handle
 int            g_atrHandle;
@@ -243,6 +255,8 @@ int OnInit()
    g_tp1Hit         = false;
    g_lastTrailPrice = 0;
    g_beApplied      = false;
+   g_lastTradeTime  = 0;
+   g_entryPrice     = 0;
 
    // ATR indicator
    g_atrHandle = INVALID_HANDLE;
@@ -261,9 +275,12 @@ int OnInit()
 
    EventSetMillisecondTimer(3000);
 
-   Print("OrderFlow VWAP EA v2 initialized. Delta method: ",
+   Print("OrderFlow VWAP EA v2.4 initialized. Delta method: ",
          g_useTickFlags ? "Tick Flags" : "Tick Rule",
-         " | Min score: ", InpMinScore);
+         " | Min score: ", InpMinScore,
+         " | Prereqs: VWAP=", InpVwapPrereq,
+         " ROC=", InpDeltaRocPrereq,
+         " HVN=", InpPriorHvnPrereq);
    return(INIT_SUCCEEDED);
 }
 
@@ -287,6 +304,16 @@ void OnTick()
    if(now < g_todaySessionStart || now > g_todaySessionEnd) return;
 
    if(!g_currentProfile.isValid) return;
+
+   // Detect position close for win/loss logging
+   if(g_managedTicket > 0 && !PositionSelectByTicket(g_managedTicket))
+   {
+      if(InpSignalLog)
+         LogTradeClose(g_managedTicket);
+      g_managedTicket = 0;
+      g_managedDir    = 0;
+      g_tp1Hit        = false;
+   }
 
    if(InpUseBE && g_managedTicket > 0 && !g_beApplied)
       CheckBreakeven();
@@ -347,13 +374,6 @@ void OnTimer()
          }
          g_lastCalcTime = now;
       }
-   }
-
-   if(g_managedTicket > 0 && !PositionSelectByTicket(g_managedTicket))
-   {
-      g_managedTicket = 0;
-      g_managedDir    = 0;
-      g_tp1Hit        = false;
    }
 }
 
@@ -1155,7 +1175,8 @@ int GetConfluenceScore(double price, int direction)
       }
    }
 
-   // 5. Near prior HVN (+1)
+   // 5. Near prior HVN — prerequisite when InpPriorHvnPrereq, otherwise +1
+   bool hvnOk = false;
    for(int d = 0; d < InpDaysBack; d++)
    {
       if(!g_priorProfiles[d].isValid) continue;
@@ -1163,9 +1184,14 @@ int GetConfluenceScore(double price, int direction)
       {
          if(!g_priorProfiles[d].levels[i].isHVN) continue;
          double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
-         if(dist <= InpProximitySteps) { score++; d = InpDaysBack; break; }
+         if(dist <= InpProximitySteps) { hvnOk = true; d = InpDaysBack; break; }
       }
    }
+   if(InpPriorHvnPrereq)
+   {
+      if(!hvnOk) return -1;
+   }
+   else if(hvnOk) score++;
 
    // 6. Delta in favor (+1)
    if(direction > 0 && g_cumDelta > 0) score++;
@@ -1610,6 +1636,9 @@ void CheckSignals()
 
    if(!IsWithinActiveWindow(now)) return;
 
+   if(InpGlobalCooldown > 0 && g_lastTradeTime > 0 &&
+      (now - g_lastTradeTime) < InpGlobalCooldown) return;
+
    MqlDateTime dtNow;
    TimeToStruct(now, dtNow);
    datetime today = (datetime)(now - now % 86400);
@@ -1629,7 +1658,7 @@ void CheckSignals()
    if(IsInCooldown(mid, now)) return;
 
    // --- Score both directions with breakdown ---
-   // Returns -1 when a prerequisite (VWAP/DeltaROC) fails
+   // Returns -1 when a prerequisite (VWAP/DeltaROC/PriorHVN) fails
    int lVwap, lHvn, lPPoc, lPVa, lPHvn, lDelta, lRoc, lVol;
    int sVwap, sHvn, sPPoc, sPVa, sPHvn, sDelta, sRoc, sVol;
    int longScore  = GetConfluenceScoreDetailed(mid, 1,
@@ -1736,6 +1765,17 @@ void CheckSignals()
       g_lastTrailPrice = entryPrice;
       g_beApplied     = false;
       g_tradesToday++;
+      g_lastTradeTime = now;
+
+      g_entryPrice = entryPrice;
+      g_entrySL    = sl;
+      g_entryTP1   = tp1;
+      g_entryTP2   = tp2;
+      g_entryScore = score;
+      g_entryVwap  = wVwap; g_entryHvn  = wHvn;
+      g_entryPPoc  = wPPoc; g_entryPVa  = wPVa;
+      g_entryPHvn  = wPHvn; g_entryDelta = wDelta;
+      g_entryRoc   = wRoc;  g_entryVol  = wVol;
 
       if(InpSignalLog)
          LogSignalEvaluation(now, mid, tradeDir,
@@ -1883,7 +1923,8 @@ void OpenSignalLog()
          "Total_Score", "Min_Score",
          "SL", "SL_Dist", "TP1", "TP1_Dist", "TP2",
          "RR_Ratio",
-         "Outcome", "Reject_Reason");
+         "Outcome", "Reject_Reason",
+         "Close_Price", "Close_Time", "Result", "PnL", "Duration_Min");
       g_signalLogHeaderWritten = true;
    }
 }
@@ -1922,8 +1963,119 @@ void LogSignalEvaluation(datetime time, double price, int direction,
       (tp2 > 0 ? DoubleToString(tp2, _Digits) : ""),
       DoubleToString(rr, 2),
       outcome,
-      rejectReason);
+      rejectReason,
+      "", "", "", "", "");
    FileFlush(g_signalLogHandle);
+}
+
+//+------------------------------------------------------------------+
+//| Log trade close with win/loss result                              |
+//+------------------------------------------------------------------+
+void LogTradeClose(ulong ticket)
+{
+   if(g_signalLogHandle == INVALID_HANDLE) return;
+   if(g_entryPrice <= 0) return;
+
+   // Select deal history for this position
+   datetime closeTime = TimeCurrent();
+   double closePrice = 0;
+   double profit = 0;
+   string result = "UNKNOWN";
+   datetime entryTime = 0;
+
+   HistorySelect(TimeCurrent() - 86400 * 2, TimeCurrent());
+
+   int totalDeals = HistoryDealsTotal();
+   for(int i = 0; i < totalDeals; i++)
+   {
+      ulong dealTicket = HistoryDealGetTicket(i);
+      if(dealTicket == 0) continue;
+
+      ulong dealPos = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
+      if(dealPos != ticket) continue;
+
+      long dealEntry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
+      if(dealEntry == DEAL_ENTRY_IN)
+      {
+         entryTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      }
+      else if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
+      {
+         closePrice = HistoryDealGetDouble(dealTicket, DEAL_PRICE);
+         profit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
+         profit += HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
+         profit += HistoryDealGetDouble(dealTicket, DEAL_SWAP);
+         closeTime = (datetime)HistoryDealGetInteger(dealTicket, DEAL_TIME);
+      }
+   }
+
+   if(closePrice <= 0)
+   {
+      closePrice = (g_managedDir > 0) ?
+         SymbolInfoDouble(_Symbol, SYMBOL_BID) :
+         SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   }
+
+   // Determine result by comparing close price to entry levels
+   double slDist = MathAbs(closePrice - g_entrySL);
+   double tp1Dist = (g_entryTP1 > 0) ? MathAbs(closePrice - g_entryTP1) : 9999;
+   double tp2Dist = (g_entryTP2 > 0) ? MathAbs(closePrice - g_entryTP2) : 9999;
+   double tolerance = InpPriceStep * 3;
+
+   if(slDist <= tolerance)
+      result = "LOSS_SL";
+   else if(tp2Dist <= tolerance)
+      result = "WIN_TP2";
+   else if(tp1Dist <= tolerance)
+      result = "WIN_TP1";
+   else if(profit > 0)
+      result = "WIN_OTHER";
+   else if(profit < 0)
+      result = "LOSS_OTHER";
+   else
+      result = "BREAKEVEN";
+
+   double durationMin = (entryTime > 0) ? (double)(closeTime - entryTime) / 60.0 : 0;
+
+   // Write CLOSE row with entry factors + exit details
+   FileWrite(g_signalLogHandle,
+      (entryTime > 0 ? TimeToString(entryTime, TIME_DATE | TIME_SECONDS) :
+                        TimeToString(closeTime, TIME_DATE | TIME_SECONDS)),
+      DoubleToString(g_entryPrice, _Digits),
+      (g_managedDir > 0 ? "LONG" : "SHORT"),
+      IntegerToString(g_entryVwap),
+      IntegerToString(g_entryHvn),
+      IntegerToString(g_entryPPoc),
+      IntegerToString(g_entryPVa),
+      IntegerToString(g_entryPHvn),
+      IntegerToString(g_entryDelta),
+      IntegerToString(g_entryRoc),
+      IntegerToString(g_entryVol),
+      IntegerToString(g_entryScore),
+      IntegerToString(InpMinScore),
+      DoubleToString(g_entrySL, _Digits),
+      DoubleToString(MathAbs(g_entryPrice - g_entrySL), 2),
+      DoubleToString(g_entryTP1, _Digits),
+      DoubleToString(MathAbs(g_entryTP1 - g_entryPrice), 2),
+      (g_entryTP2 > 0 ? DoubleToString(g_entryTP2, _Digits) : ""),
+      DoubleToString((MathAbs(g_entryTP1 - g_entryPrice) /
+                      MathMax(MathAbs(g_entryPrice - g_entrySL), 0.01)), 2),
+      "CLOSE",
+      result,
+      DoubleToString(closePrice, _Digits),
+      TimeToString(closeTime, TIME_DATE | TIME_SECONDS),
+      result,
+      DoubleToString(profit, 2),
+      DoubleToString(durationMin, 1));
+   FileFlush(g_signalLogHandle);
+
+   Print("Trade closed: ", result,
+         " | Entry: ", g_entryPrice,
+         " | Close: ", closePrice,
+         " | P&L: ", DoubleToString(profit, 2),
+         " | Duration: ", DoubleToString(durationMin, 1), " min");
+
+   g_entryPrice = 0;
 }
 
 //+------------------------------------------------------------------+
@@ -1979,6 +2131,8 @@ int GetConfluenceScoreDetailed(double price, int direction,
       }
    }
 
+   // 5. Near prior HVN — prerequisite or +1
+   bool hvnOk2 = false;
    for(int d = 0; d < InpDaysBack; d++)
    {
       if(!g_priorProfiles[d].isValid) continue;
@@ -1986,9 +2140,15 @@ int GetConfluenceScoreDetailed(double price, int direction,
       {
          if(!g_priorProfiles[d].levels[i].isHVN) continue;
          double dist = MathAbs(price - g_priorProfiles[d].levels[i].price) / InpPriceStep;
-         if(dist <= InpProximitySteps) { score++; outPriorHvn = 1; d = InpDaysBack; break; }
+         if(dist <= InpProximitySteps) { hvnOk2 = true; d = InpDaysBack; break; }
       }
    }
+   if(hvnOk2) outPriorHvn = 1;
+   if(InpPriorHvnPrereq)
+   {
+      if(!hvnOk2) return -1;
+   }
+   else if(hvnOk2) score++;
 
    if(direction > 0 && g_cumDelta > 0) { score++; outDeltaFav = 1; }
    if(direction < 0 && g_cumDelta < 0) { score++; outDeltaFav = 1; }

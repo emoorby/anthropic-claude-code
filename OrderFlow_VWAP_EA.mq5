@@ -87,7 +87,7 @@ input double         InpDeltaRocMin      = 5.0;         // Min Delta ROC for +1 
 input double         InpMinBarVolRatio   = 1.2;         // Min Volume Ratio vs Average
 
 input group "=== Active Trading Window ==="
-input int            InpActiveStartHour  = 15;          // Active Window Start Hour
+input int            InpActiveStartHour  = 16;          // Active Window Start Hour
 input int            InpActiveStartMin   = 30;          // Active Window Start Minute
 input int            InpActiveEndHour    = 19;          // Active Window End Hour
 input int            InpActiveEndMin     = 0;           // Active Window End Minute

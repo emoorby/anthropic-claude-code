@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "2.40"
+#property version   "2.50"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v2.4: Win/loss tracking, PriorHVN prereq, global cooldown"
+#property description "v2.5: HVN weight +2, trail fix, modified SL tracking"
 
 #include <Trade\Trade.mqh>
 
@@ -77,7 +77,7 @@ input double         InpRiskPercent      = 0.0;         // Risk % (0=fixed lot)
 input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Session
 
 input group "=== Confluence Scoring ==="
-input int            InpMinScore         = 4;           // Min Score to Enter (max ~6)
+input int            InpMinScore         = 4;           // Min Score to Enter (max ~5)
 input bool           InpVwapPrereq       = true;        // VWAP Alignment Required (not scored)
 input bool           InpDeltaRocPrereq   = true;        // Delta ROC Required (not scored)
 input bool           InpPriorHvnPrereq   = true;        // Prior HVN Required (not scored)
@@ -108,7 +108,8 @@ input double         InpPartialClosePct  = 50.0;        // % to Close at TP1
 
 input group "=== Trailing Stop ==="
 input bool           InpUseTrailing      = true;        // Trail Stop to Cleared HVNs
-input double         InpTrailPadding     = 2.0;         // Trail Padding Beyond HVN (price units)
+input double         InpTrailPadding     = 5.0;         // Trail Padding Beyond HVN (price units)
+input double         InpTrailMinPct      = 50.0;        // Min Trail Dist (% of SL) Before TP1
 
 input group "=== Breakeven ==="
 input bool           InpUseBE            = true;        // Enable ATR Breakeven
@@ -204,6 +205,7 @@ datetime       g_lastTradeTime;
 // Entry details for win/loss logging
 double         g_entryPrice;
 double         g_entrySL;
+double         g_currentSL;
 double         g_entryTP1;
 double         g_entryTP2;
 int            g_entryScore;
@@ -257,6 +259,7 @@ int OnInit()
    g_beApplied      = false;
    g_lastTradeTime  = 0;
    g_entryPrice     = 0;
+   g_currentSL      = 0;
 
    // ATR indicator
    g_atrHandle = INVALID_HANDLE;
@@ -275,7 +278,7 @@ int OnInit()
 
    EventSetMillisecondTimer(3000);
 
-   Print("OrderFlow VWAP EA v2.4 initialized. Delta method: ",
+   Print("OrderFlow VWAP EA v2.5 initialized. Delta method: ",
          g_useTickFlags ? "Tick Flags" : "Tick Rule",
          " | Min score: ", InpMinScore,
          " | Prereqs: VWAP=", InpVwapPrereq,
@@ -1138,13 +1141,13 @@ int GetConfluenceScore(double price, int direction)
    }
    else if(vwapOk) score++;
 
-   // 2. At current session HVN or POC (+1)
+   // 2. At current session HVN or POC (+2)
    int lvl = FindNearestLevel(g_currentProfile, price);
    if(lvl >= 0)
    {
       if(g_currentProfile.levels[lvl].isHVN ||
          g_currentProfile.levels[lvl].isPOC)
-         score++;
+         score += 2;
    }
 
    // 3. Near prior day POC (+2 - strong level)
@@ -1207,8 +1210,7 @@ int GetConfluenceScore(double price, int direction)
    }
    else if(rocOk) score++;
 
-   // 8. Volume above average (+1)
-   if(IsVolumeAboveAverage()) score++;
+   // 8. Volume above average (logged only, not scored — unreliable in tester)
 
    return score;
 }
@@ -1572,15 +1574,31 @@ void ManageTrailingStop()
 
    newSL = NormalizeDouble(newSL, _Digits);
 
+   // Before TP1, enforce minimum distance from entry
+   if(!g_tp1Hit && InpTrailMinPct > 0 && g_entrySL != 0)
+   {
+      double origDist = MathAbs(g_entryPrice - g_entrySL);
+      double minDist  = origDist * InpTrailMinPct / 100.0;
+      double trailDist = MathAbs(newSL - posPrice);
+      if(trailDist < minDist)
+         return;
+   }
+
    if(g_managedDir > 0 && newSL > currentSL && newSL < bid)
    {
       if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
+      {
+         g_currentSL = newSL;
          Print("Trail SL moved to ", newSL, " (HVN cleared)");
+      }
    }
    else if(g_managedDir < 0 && (newSL < currentSL || currentSL == 0) && newSL > ask)
    {
       if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
+      {
+         g_currentSL = newSL;
          Print("Trail SL moved to ", newSL, " (HVN cleared)");
+      }
    }
 }
 
@@ -1780,6 +1798,7 @@ void CheckSignals()
 
       g_entryPrice = entryPrice;
       g_entrySL    = sl;
+      g_currentSL  = sl;
       g_entryTP1   = tp1;
       g_entryTP2   = tp2;
       g_entryScore = score;
@@ -1899,6 +1918,7 @@ void CheckBreakeven()
    if(g_trade.PositionModify(g_managedTicket, newSL, curTP))
    {
       g_beApplied = true;
+      g_currentSL = newSL;
       Print("Breakeven applied. SL moved to ", newSL,
             " (ATR=", DoubleToString(atrVal, _Digits),
             ", trigger=", DoubleToString(trigger, _Digits), ")");
@@ -2027,14 +2047,20 @@ void LogTradeClose(ulong ticket)
          SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    }
 
-   // Determine result by comparing close price to entry levels
+   // Determine result by comparing close price to entry levels and modified SL
    double slDist = MathAbs(closePrice - g_entrySL);
+   double modSlDist = (g_currentSL != 0 && g_currentSL != g_entrySL)
+                      ? MathAbs(closePrice - g_currentSL) : 9999;
    double tp1Dist = (g_entryTP1 > 0) ? MathAbs(closePrice - g_entryTP1) : 9999;
    double tp2Dist = (g_entryTP2 > 0) ? MathAbs(closePrice - g_entryTP2) : 9999;
    double tolerance = InpPriceStep * 3;
 
    if(slDist <= tolerance)
       result = "LOSS_SL";
+   else if(modSlDist <= tolerance && profit <= 0)
+      result = "LOSS_TRAIL";
+   else if(modSlDist <= tolerance && profit > 0)
+      result = "WIN_TRAIL";
    else if(tp2Dist <= tolerance)
       result = "WIN_TP2";
    else if(tp1Dist <= tolerance)
@@ -2117,7 +2143,7 @@ int GetConfluenceScoreDetailed(double price, int direction,
    {
       if(g_currentProfile.levels[lvl].isHVN ||
          g_currentProfile.levels[lvl].isPOC)
-      { score++; outAtHvn = 1; }
+      { score += 2; outAtHvn = 2; }
    }
 
    for(int d = 0; d < InpDaysBack; d++)
@@ -2175,7 +2201,8 @@ int GetConfluenceScoreDetailed(double price, int direction,
    }
    else if(rocOk) score++;
 
-   if(IsVolumeAboveAverage()) { score++; outVolAbove = 1; }
+   // Volume above average — logged only, not scored (unreliable in tester)
+   if(IsVolumeAboveAverage()) outVolAbove = 1;
 
    return score;
 }

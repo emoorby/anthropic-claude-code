@@ -77,7 +77,8 @@ input double         InpRiskPercent      = 0.0;         // Risk % (0=fixed lot)
 input int            InpMaxTradesPerDay  = 3;           // Max Trades Per Session
 
 input group "=== Confluence Scoring ==="
-input int            InpMinScore         = 4;           // Min Score to Enter (max ~5)
+input int            InpMinScore         = 4;           // Min Score to Enter (max ~6)
+input int            InpPriorPOCWeight   = 2;           // Prior POC Score Weight (0-2)
 input bool           InpVwapPrereq       = true;        // VWAP Alignment Required (not scored)
 input bool           InpDeltaRocPrereq   = true;        // Delta ROC Required (not scored)
 input bool           InpPriorHvnPrereq   = true;        // Prior HVN Required (not scored)
@@ -1186,14 +1187,14 @@ int GetConfluenceScore(double price, int direction)
          score += 2;
    }
 
-   // 3. Near prior day POC (+2 - strong level)
+   // 3. Near prior day POC (configurable weight)
    for(int d = 0; d < InpDaysBack; d++)
    {
       if(!g_priorProfiles[d].isValid) continue;
       double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
       if(dist <= InpProximitySteps)
       {
-         score += 2;
+         score += InpPriorPOCWeight;
          break;
       }
    }
@@ -2188,7 +2189,7 @@ int GetConfluenceScoreDetailed(double price, int direction,
    {
       if(!g_priorProfiles[d].isValid) continue;
       double dist = MathAbs(price - g_priorProfiles[d].pocPrice) / InpPriceStep;
-      if(dist <= InpProximitySteps) { score += 2; outPriorPoc = 2; break; }
+      if(dist <= InpProximitySteps) { score += InpPriorPOCWeight; outPriorPoc = InpPriorPOCWeight; break; }
    }
 
    for(int d = 0; d < InpDaysBack; d++)

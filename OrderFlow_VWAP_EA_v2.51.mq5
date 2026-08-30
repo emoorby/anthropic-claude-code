@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "3.00"
+#property version   "2.51"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v3.00: Same-dir loss limit, H4/D1 trend filter, ADR filter"
+#property description "v2.51: Day-of-week and blocked-hour filters"
 
 #include <Trade\Trade.mqh>
 
@@ -133,23 +133,6 @@ input int            InpCooldownSeconds  = 600;         // Seconds Before Re-ent
 input double         InpCooldownZoneSize = 3.0;         // Zone Size (price steps)
 input int            InpGlobalCooldown   = 600;         // Min Seconds Between Any Two Trades
 
-input group "=== Direction Loss Limit ==="
-input bool           InpUseDirLimit      = true;        // Enable Same-Direction Loss Limit
-input int            InpMaxSameDirLosses = 2;           // Max Consecutive Same-Dir Losses (then block)
-
-input group "=== Trend Filter (H4/D1) ==="
-input bool           InpUseTrendFilter   = false;       // Enable Higher-TF Trend Filter
-input ENUM_TIMEFRAMES InpTrendTF         = PERIOD_H4;   // Trend Timeframe
-input int            InpTrendMAPeriod    = 50;          // MA Period for Trend
-input int            InpTrendSlopeBars   = 5;           // Bars to Measure MA Slope
-input double         InpTrendSlopeMin    = 0.0;         // Min Slope to Confirm Trend (0=any)
-
-input group "=== ADR Filter ==="
-input bool           InpUseADRFilter     = false;       // Enable ADR Range Filter
-input int            InpADRPeriod        = 10;          // ADR Lookback (days)
-input double         InpMinADR           = 200.0;       // Min ADR to Trade (price units)
-input int            InpMaxTradesLowADR  = 2;           // Max Trades When ADR < Min (0=skip)
-
 //--- Structures
 struct PriceLevel
 {
@@ -215,18 +198,6 @@ TradedZone     g_tradedZones[50];
 int            g_tradedZoneCount;
 int            g_tradesToday;
 datetime       g_lastTradeDay;
-
-// Same-direction loss tracking
-int            g_consLongLosses;
-int            g_consShortLosses;
-bool           g_longBlocked;
-bool           g_shortBlocked;
-
-// Trend filter
-int            g_trendMAHandle;
-
-// ADR filter
-double         g_currentADR;
 
 // Position management
 ulong          g_managedTicket;
@@ -296,12 +267,6 @@ int OnInit()
    g_entryPrice     = 0;
    g_currentSL      = 0;
 
-   // Direction loss limit state
-   g_consLongLosses  = 0;
-   g_consShortLosses = 0;
-   g_longBlocked     = false;
-   g_shortBlocked    = false;
-
    // ATR indicator
    g_atrHandle = INVALID_HANDLE;
    if(InpUseBE)
@@ -311,20 +276,6 @@ int OnInit()
          Print("Warning: failed to create ATR indicator");
    }
 
-   // Trend filter MA
-   g_trendMAHandle = INVALID_HANDLE;
-   if(InpUseTrendFilter)
-   {
-      g_trendMAHandle = iMA(_Symbol, InpTrendTF, InpTrendMAPeriod, 0, MODE_SMA, PRICE_CLOSE);
-      if(g_trendMAHandle == INVALID_HANDLE)
-         Print("Warning: failed to create trend MA indicator");
-   }
-
-   // ADR initial calculation
-   g_currentADR = 0;
-   if(InpUseADRFilter)
-      g_currentADR = CalculateADR();
-
    // Signal log file
    g_signalLogHandle = INVALID_HANDLE;
    g_signalLogHeaderWritten = false;
@@ -333,15 +284,15 @@ int OnInit()
 
    EventSetMillisecondTimer(3000);
 
-   Print("OrderFlow VWAP EA v3.00 initialized. Delta method: ",
+   Print("OrderFlow VWAP EA v2.51 initialized. Delta method: ",
          g_useTickFlags ? "Tick Flags" : "Tick Rule",
          " | Min score: ", InpMinScore,
          " | Prereqs: VWAP=", InpVwapPrereq,
          " ROC=", InpDeltaRocPrereq,
          " HVN=", InpPriorHvnPrereq,
-         " | DirLimit=", InpUseDirLimit ? IntegerToString(InpMaxSameDirLosses) : "off",
-         " | TrendFilter=", InpUseTrendFilter ? EnumToString(InpTrendTF) : "off",
-         " | ADR=", InpUseADRFilter ? DoubleToString(InpMinADR, 0) : "off");
+         " | BlockedDays=", InpBlockedDays,
+         " BlockedHour=", InpBlockedHourStart < 0 ? "off" :
+            IntegerToString(InpBlockedHourStart) + "-" + IntegerToString(InpBlockedHourEnd));
    return(INIT_SUCCEEDED);
 }
 
@@ -352,8 +303,6 @@ void OnDeinit(const int reason)
    RemoveAllObjects();
    if(g_atrHandle != INVALID_HANDLE)
       IndicatorRelease(g_atrHandle);
-   if(g_trendMAHandle != INVALID_HANDLE)
-      IndicatorRelease(g_trendMAHandle);
    if(g_signalLogHandle != INVALID_HANDLE)
       FileClose(g_signalLogHandle);
 }
@@ -371,8 +320,6 @@ void OnTick()
    // Detect position close for win/loss logging
    if(g_managedTicket > 0 && !PositionSelectByTicket(g_managedTicket))
    {
-      if(InpUseDirLimit)
-         UpdateDirectionLossTracking(g_managedTicket, g_managedDir);
       if(InpSignalLog)
          LogTradeClose(g_managedTicket);
       g_managedTicket = 0;
@@ -410,12 +357,6 @@ void OnTimer()
       g_tradesToday       = 0;
       g_deltaSnapCount    = 0;
       g_deltaSnapIdx      = 0;
-      g_consLongLosses    = 0;
-      g_consShortLosses   = 0;
-      g_longBlocked       = false;
-      g_shortBlocked      = false;
-      if(InpUseADRFilter)
-         g_currentADR = CalculateADR();
       BuildPriorProfiles();
       if(InpDrawProfiles) DrawAllPriorProfiles();
       if(InpExportCSV) ExportAllProfiles();
@@ -1150,146 +1091,6 @@ bool IsHourBlocked(datetime now)
 }
 
 //+------------------------------------------------------------------+
-//| Same-direction loss tracking                                     |
-//+------------------------------------------------------------------+
-void UpdateDirectionLossTracking(ulong ticket, int dir)
-{
-   double profit = GetClosedPositionProfit(ticket);
-
-   if(profit < 0)
-   {
-      if(dir > 0)
-      {
-         g_consLongLosses++;
-         g_consShortLosses = 0;
-         if(g_consLongLosses >= InpMaxSameDirLosses)
-         {
-            g_longBlocked = true;
-            Print("Direction blocked: LONG (", g_consLongLosses, " consecutive losses)");
-         }
-      }
-      else
-      {
-         g_consShortLosses++;
-         g_consLongLosses = 0;
-         if(g_consShortLosses >= InpMaxSameDirLosses)
-         {
-            g_shortBlocked = true;
-            Print("Direction blocked: SHORT (", g_consShortLosses, " consecutive losses)");
-         }
-      }
-   }
-   else
-   {
-      if(dir > 0)
-         g_consLongLosses = 0;
-      else
-         g_consShortLosses = 0;
-   }
-}
-
-double GetClosedPositionProfit(ulong ticket)
-{
-   HistorySelect(TimeCurrent() - 86400 * 2, TimeCurrent());
-   double profit = 0;
-   int totalDeals = HistoryDealsTotal();
-   for(int i = 0; i < totalDeals; i++)
-   {
-      ulong dealTicket = HistoryDealGetTicket(i);
-      if(dealTicket == 0) continue;
-      ulong dealPos = HistoryDealGetInteger(dealTicket, DEAL_POSITION_ID);
-      if(dealPos != ticket) continue;
-      long dealEntry = HistoryDealGetInteger(dealTicket, DEAL_ENTRY);
-      if(dealEntry == DEAL_ENTRY_OUT || dealEntry == DEAL_ENTRY_OUT_BY)
-      {
-         profit += HistoryDealGetDouble(dealTicket, DEAL_PROFIT);
-         profit += HistoryDealGetDouble(dealTicket, DEAL_COMMISSION);
-         profit += HistoryDealGetDouble(dealTicket, DEAL_SWAP);
-      }
-   }
-   return profit;
-}
-
-bool IsDirectionBlocked(int direction)
-{
-   if(!InpUseDirLimit) return false;
-   if(direction > 0 && g_longBlocked) return true;
-   if(direction < 0 && g_shortBlocked) return true;
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Higher-timeframe trend filter                                    |
-//+------------------------------------------------------------------+
-int GetTrendDirection()
-{
-   if(!InpUseTrendFilter || g_trendMAHandle == INVALID_HANDLE)
-      return 0;
-
-   double ma[];
-   if(CopyBuffer(g_trendMAHandle, 0, 0, InpTrendSlopeBars + 1, ma) < InpTrendSlopeBars + 1)
-      return 0;
-
-   double currentMA = ma[InpTrendSlopeBars];
-   double priorMA   = ma[0];
-   double slope     = currentMA - priorMA;
-
-   if(InpTrendSlopeMin > 0 && MathAbs(slope) < InpTrendSlopeMin)
-      return 0;
-
-   if(slope > 0) return 1;
-   if(slope < 0) return -1;
-   return 0;
-}
-
-bool IsTrendFiltered(int tradeDir)
-{
-   if(!InpUseTrendFilter) return false;
-
-   int trend = GetTrendDirection();
-   if(trend == 0) return false;
-
-   if(tradeDir > 0 && trend < 0) return true;
-   if(tradeDir < 0 && trend > 0) return true;
-   return false;
-}
-
-//+------------------------------------------------------------------+
-//| Average Daily Range filter                                       |
-//+------------------------------------------------------------------+
-double CalculateADR()
-{
-   double totalRange = 0;
-   int counted = 0;
-
-   MqlRates daily[];
-   int copied = CopyRates(_Symbol, PERIOD_D1, 1, InpADRPeriod, daily);
-   if(copied <= 0) return 0;
-
-   for(int i = 0; i < copied; i++)
-   {
-      double range = daily[i].high - daily[i].low;
-      totalRange += range;
-      counted++;
-   }
-
-   return (counted > 0) ? totalRange / counted : 0;
-}
-
-bool IsADRFiltered()
-{
-   if(!InpUseADRFilter) return false;
-   return (g_currentADR < InpMinADR && InpMaxTradesLowADR == 0);
-}
-
-int GetEffectiveMaxTrades()
-{
-   if(InpUseADRFilter && g_currentADR < InpMinADR && InpMaxTradesLowADR > 0)
-      return InpMaxTradesLowADR;
-   return InpMaxTradesPerDay;
-}
-
-//+------------------------------------------------------------------+
 //| Volume confirmation (current bar vs recent average)              |
 //+------------------------------------------------------------------+
 bool IsVolumeAboveAverage()
@@ -1914,10 +1715,7 @@ void CheckSignals()
       g_tradesToday = 0;
       g_lastTradeDay = today;
    }
-   int maxTrades = GetEffectiveMaxTrades();
-   if(g_tradesToday >= maxTrades) return;
-
-   if(IsADRFiltered()) return;
+   if(g_tradesToday >= InpMaxTradesPerDay) return;
 
    if(HasOpenPosition()) return;
 
@@ -1980,28 +1778,6 @@ void CheckSignals()
    int wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol;
    if(tradeDir > 0) { wVwap=lVwap; wHvn=lHvn; wPPoc=lPPoc; wPVa=lPVa; wPHvn=lPHvn; wDelta=lDelta; wRoc=lRoc; wVol=lVol; }
    else              { wVwap=sVwap; wHvn=sHvn; wPPoc=sPPoc; wPVa=sPVa; wPHvn=sPHvn; wDelta=sDelta; wRoc=sRoc; wVol=sVol; }
-
-   // --- Direction loss limit filter ---
-   if(IsDirectionBlocked(tradeDir))
-   {
-      if(InpSignalLog && !InpLogTradesOnly)
-         LogSignalEvaluation(now, mid, tradeDir,
-            wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
-            (tradeDir > 0 ? longScore : shortScore),
-            0, 0, 0, "SKIP", "dir_blocked");
-      return;
-   }
-
-   // --- Higher-timeframe trend filter ---
-   if(IsTrendFiltered(tradeDir))
-   {
-      if(InpSignalLog && !InpLogTradesOnly)
-         LogSignalEvaluation(now, mid, tradeDir,
-            wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
-            (tradeDir > 0 ? longScore : shortScore),
-            0, 0, 0, "SKIP", "trend_filtered");
-      return;
-   }
 
    // --- Calculate dynamic SL/TP ---
    double entryPrice = (tradeDir > 0) ? ask : bid;

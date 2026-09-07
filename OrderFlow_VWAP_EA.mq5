@@ -414,6 +414,7 @@ void OnTimer()
       g_consShortLosses   = 0;
       g_longBlocked       = false;
       g_shortBlocked      = false;
+      g_currentProfile.isValid = false;
       if(InpUseADRFilter)
          g_currentADR = CalculateADR();
       BuildPriorProfiles();
@@ -427,6 +428,7 @@ void OnTimer()
       {
          g_currentProfile.sessionStart = g_todaySessionStart;
          g_currentProfile.sessionEnd   = g_todaySessionEnd;
+         g_currentProfile.sessionDate  = g_todaySessionStart;
          BuildProfileFromTicks(g_todaySessionStart, now, g_currentProfile);
          if(g_currentProfile.isValid)
          {
@@ -806,8 +808,18 @@ void CalculateVWAP(datetime start, datetime end)
 
 void CalculateVWAPForRange(datetime start, datetime end, double &vwapOut)
 {
+   double savePV    = g_cumPV;
+   double saveVol   = g_cumVol;
+   double saveDelta = g_cumDelta;
+   double saveVwap  = g_vwap;
+
    CalculateVWAP(start, end);
    vwapOut = g_vwap;
+
+   g_cumPV    = savePV;
+   g_cumVol   = saveVol;
+   g_cumDelta = saveDelta;
+   g_vwap     = saveVwap;
 }
 
 //+------------------------------------------------------------------+
@@ -1163,7 +1175,6 @@ void UpdateDirectionLossTracking(ulong ticket, int dir)
       if(dir > 0)
       {
          g_consLongLosses++;
-         g_consShortLosses = 0;
          if(g_consLongLosses >= InpMaxSameDirLosses)
          {
             g_longBlocked = true;
@@ -1173,7 +1184,6 @@ void UpdateDirectionLossTracking(ulong ticket, int dir)
       else
       {
          g_consShortLosses++;
-         g_consLongLosses = 0;
          if(g_consShortLosses >= InpMaxSameDirLosses)
          {
             g_shortBlocked = true;
@@ -1908,14 +1918,6 @@ void CheckSignals()
    if(InpGlobalCooldown > 0 && g_lastTradeTime > 0 &&
       (now - g_lastTradeTime) < InpGlobalCooldown) return;
 
-   MqlDateTime dtNow;
-   TimeToStruct(now, dtNow);
-   datetime today = (datetime)(now - now % 86400);
-   if(today != g_lastTradeDay)
-   {
-      g_tradesToday = 0;
-      g_lastTradeDay = today;
-   }
    int maxTrades = GetEffectiveMaxTrades();
    if(g_tradesToday >= maxTrades) return;
 
@@ -2024,7 +2026,6 @@ void CheckSignals()
    // Require reward >= risk
    if(tp1Dist < slDist * InpMinRR)
    {
-      RecordTradedZone(mid, now);
       if(InpSignalLog && !InpLogTradesOnly)
          LogSignalEvaluation(now, mid, tradeDir,
             wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,

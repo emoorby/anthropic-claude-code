@@ -425,6 +425,8 @@ void OnTimer()
    {
       if(now - g_lastCalcTime >= 3)
       {
+         g_currentProfile.sessionStart = g_todaySessionStart;
+         g_currentProfile.sessionEnd   = g_todaySessionEnd;
          BuildProfileFromTicks(g_todaySessionStart, now, g_currentProfile);
          if(g_currentProfile.isValid)
          {

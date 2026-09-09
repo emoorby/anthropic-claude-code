@@ -3,9 +3,9 @@
 //| Order Flow + VWAP + Volume Profile Strategy                       |
 //+------------------------------------------------------------------+
 #property copyright "Order Flow VWAP Strategy"
-#property version   "3.00"
+#property version   "3.10"
 #property description "Volume Profile with HVN/LVN/POC, VWAP, Delta Volume"
-#property description "v3.00: Same-dir loss limit, H4/D1 trend filter, ADR filter"
+#property description "v3.10: Diagnostic log file for debugging live vs tester differences"
 
 #include <Trade\Trade.mqh>
 
@@ -127,6 +127,10 @@ input group "=== Signal Log ==="
 input bool           InpSignalLog        = true;        // Log Signals to CSV
 input bool           InpLogTradesOnly    = true;        // Log Only Executed Trades (vs all evals)
 input string         InpSignalLogFolder  = "OrderFlow"; // Signal Log Subfolder
+
+input group "=== Diagnostic Log ==="
+input bool           InpDiagLog          = true;        // Enable Diagnostic Log File
+input int            InpDiagHeartbeatMin = 15;          // Heartbeat Interval (minutes, 0=off)
 
 input group "=== Cooldown ==="
 input int            InpCooldownSeconds  = 600;         // Seconds Before Re-entry at Same Zone
@@ -254,6 +258,10 @@ int            g_atrHandle;
 int            g_signalLogHandle;
 bool           g_signalLogHeaderWritten;
 
+// Diagnostic log
+int            g_diagLogHandle;
+datetime       g_lastHeartbeat;
+
 //+------------------------------------------------------------------+
 int OnInit()
 {
@@ -331,6 +339,11 @@ int OnInit()
    if(InpSignalLog)
       OpenSignalLog();
 
+   // Diagnostic log file
+   g_diagLogHandle = INVALID_HANDLE;
+   g_lastHeartbeat = 0;
+   OpenDiagLog();
+
    EventSetMillisecondTimer(3000);
 
    Print("OrderFlow VWAP EA v3.00 initialized. Delta method: ",
@@ -356,12 +369,15 @@ void OnDeinit(const int reason)
       IndicatorRelease(g_trendMAHandle);
    if(g_signalLogHandle != INVALID_HANDLE)
       FileClose(g_signalLogHandle);
+   CloseDiagLog();
 }
 
 //+------------------------------------------------------------------+
 void OnTick()
 {
    if(!InpEnableTrading) return;
+
+   DiagLogHeartbeat();
 
    datetime now = TimeCurrent();
    if(now < g_todaySessionStart || now > g_todaySessionEnd) return;
@@ -420,6 +436,7 @@ void OnTimer()
       BuildPriorProfiles();
       if(InpDrawProfiles) DrawAllPriorProfiles();
       if(InpExportCSV) ExportAllProfiles();
+      DiagLogSessionStart();
    }
 
    if(now >= g_todaySessionStart && now <= g_todaySessionEnd)
@@ -429,9 +446,13 @@ void OnTimer()
          g_currentProfile.sessionStart = g_todaySessionStart;
          g_currentProfile.sessionEnd   = g_todaySessionEnd;
          g_currentProfile.sessionDate  = g_todaySessionStart;
+         bool wasValid = g_currentProfile.isValid;
          BuildProfileFromTicks(g_todaySessionStart, now, g_currentProfile);
          if(g_currentProfile.isValid)
          {
+            if(!wasValid)
+               DiagLogProfileStatus("first_valid");
+
             CalculateVWAP(g_todaySessionStart, now);
             g_currentProfile.vwap = g_vwap;
 
@@ -1176,27 +1197,33 @@ void UpdateDirectionLossTracking(ulong ticket, int dir)
       {
          g_consLongLosses++;
          if(g_consLongLosses >= InpMaxSameDirLosses)
-         {
             g_longBlocked = true;
+         DiagLogDirLoss(dir, g_consLongLosses, g_longBlocked);
+         if(g_longBlocked)
             Print("Direction blocked: LONG (", g_consLongLosses, " consecutive losses)");
-         }
       }
       else
       {
          g_consShortLosses++;
          if(g_consShortLosses >= InpMaxSameDirLosses)
-         {
             g_shortBlocked = true;
+         DiagLogDirLoss(dir, g_consShortLosses, g_shortBlocked);
+         if(g_shortBlocked)
             Print("Direction blocked: SHORT (", g_consShortLosses, " consecutive losses)");
-         }
       }
    }
    else
    {
       if(dir > 0)
+      {
          g_consLongLosses = 0;
+         DiagWrite("DIR_WIN: LONG reset consecutive losses to 0");
+      }
       else
+      {
          g_consShortLosses = 0;
+         DiagWrite("DIR_WIN: SHORT reset consecutive losses to 0");
+      }
    }
 }
 
@@ -1836,6 +1863,7 @@ void ManageTrailingStop()
    {
       if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
       {
+         DiagLogStopMove("TRAIL", currentSL, newSL, posPrice, bid);
          g_currentSL = newSL;
          Print("Trail SL moved to ", newSL, " (HVN cleared)");
       }
@@ -1844,6 +1872,7 @@ void ManageTrailingStop()
    {
       if(g_trade.PositionModify(g_managedTicket, newSL, currentTP))
       {
+         DiagLogStopMove("TRAIL", currentSL, newSL, posPrice, ask);
          g_currentSL = newSL;
          Print("Trail SL moved to ", newSL, " (HVN cleared)");
       }
@@ -1911,25 +1940,26 @@ void CheckSignals()
 
    // --- Pre-filters (fast rejection) ---
 
-   if(!IsWithinActiveWindow(now)) return;
-   if(IsDayBlocked(now)) return;
-   if(IsHourBlocked(now)) return;
+   if(!IsWithinActiveWindow(now)) { DiagLogPreFilter("outside_active_window"); return; }
+   if(IsDayBlocked(now)) { DiagLogPreFilter("day_blocked"); return; }
+   if(IsHourBlocked(now)) { DiagLogPreFilter("hour_blocked"); return; }
 
    if(InpGlobalCooldown > 0 && g_lastTradeTime > 0 &&
-      (now - g_lastTradeTime) < InpGlobalCooldown) return;
+      (now - g_lastTradeTime) < InpGlobalCooldown)
+   { DiagLogPreFilter("global_cooldown (last trade " + IntegerToString((int)(now - g_lastTradeTime)) + "s ago)"); return; }
 
    int maxTrades = GetEffectiveMaxTrades();
-   if(g_tradesToday >= maxTrades) return;
+   if(g_tradesToday >= maxTrades) { DiagLogPreFilter("max_trades_reached (" + IntegerToString(g_tradesToday) + "/" + IntegerToString(maxTrades) + ")"); return; }
 
-   if(IsADRFiltered()) return;
+   if(IsADRFiltered()) { DiagLogPreFilter("ADR_filtered (ADR=" + DoubleToString(g_currentADR, 1) + ")"); return; }
 
-   if(HasOpenPosition()) return;
+   if(HasOpenPosition()) { DiagLogPreFilter("open_position"); return; }
 
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double mid = (bid + ask) / 2.0;
 
-   if(IsInCooldown(mid, now)) return;
+   if(IsInCooldown(mid, now)) { DiagLogPreFilter("zone_cooldown"); return; }
 
    // --- Score both directions with breakdown ---
    // Returns -1 when a prerequisite (VWAP/DeltaROC/PriorHVN) fails
@@ -2073,6 +2103,8 @@ void CheckSignals()
       g_entryPHvn  = wPHvn; g_entryDelta = wDelta;
       g_entryRoc   = wRoc;  g_entryVol  = wVol;
 
+      DiagLogTradeOpen(tradeDir, entryPrice, sl, tp1, tp2, score, lots);
+
       if(InpSignalLog)
          LogSignalEvaluation(now, mid, tradeDir,
             wVwap, wHvn, wPPoc, wPVa, wPHvn, wDelta, wRoc, wVol,
@@ -2183,6 +2215,9 @@ void CheckBreakeven()
    newSL = NormalizeDouble(newSL, _Digits);
    if(g_trade.PositionModify(g_managedTicket, newSL, curTP))
    {
+      double currentPrice = (g_managedDir > 0) ? bid : ask;
+      DiagLogStopMove("BE (ATR=" + DoubleToString(atrVal, 1) + " trig=" + DoubleToString(trigger, 1) + ")",
+                      curSL, newSL, posPrice, currentPrice);
       g_beApplied = true;
       g_currentSL = newSL;
       Print("Breakeven applied. SL moved to ", newSL,
@@ -2372,6 +2407,8 @@ void LogTradeClose(ulong ticket)
       DoubleToString(durationMin, 1));
    FileFlush(g_signalLogHandle);
 
+   DiagLogTradeClose(result, g_entryPrice, closePrice, profit, durationMin);
+
    Print("Trade closed: ", result,
          " | Entry: ", g_entryPrice,
          " | Close: ", closePrice,
@@ -2533,5 +2570,202 @@ double GetLotSize(double slDistance)
    lots = MathMax(minLot, MathMin(maxLot, lots));
 
    return lots;
+}
+
+//+------------------------------------------------------------------+
+//| Diagnostic Log                                                    |
+//+------------------------------------------------------------------+
+void OpenDiagLog()
+{
+   if(!InpDiagLog) return;
+
+   string filename = InpSignalLogFolder + "\\DiagLog_" + _Symbol + ".log";
+   g_diagLogHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_TXT | FILE_COMMON);
+   if(g_diagLogHandle == INVALID_HANDLE)
+   {
+      Print("Warning: cannot open diagnostic log: ", filename);
+      return;
+   }
+   FileSeek(g_diagLogHandle, 0, SEEK_END);
+   DiagWrite("=== EA STARTED === Version " + (string)__FILE__ +
+             " | Symbol=" + _Symbol +
+             " | Account=" + IntegerToString(AccountInfoInteger(ACCOUNT_LOGIN)) +
+             " | Server=" + AccountInfoString(ACCOUNT_SERVER));
+   DiagWrite("Settings: Trading=" + (InpEnableTrading ? "ON" : "OFF") +
+             " | Lots=" + DoubleToString(InpLotSize, 2) +
+             " | MaxTrades=" + IntegerToString(InpMaxTradesPerDay) +
+             " | MinScore=" + IntegerToString(InpMinScore) +
+             " | MinRR=" + DoubleToString(InpMinRR, 1));
+   DiagWrite("Stops: SLMode=" + IntegerToString(InpSLMode) +
+             " | Trail=" + (InpUseTrailing ? "ON pad=" + DoubleToString(InpTrailPadding, 1) +
+               " minPct=" + DoubleToString(InpTrailMinPct, 0) : "OFF") +
+             " | BE=" + (InpUseBE ? "ON atr=" + IntegerToString(InpBE_ATR_Period) +
+               " multi=" + DoubleToString(InpBE_ATR_Multi, 1) +
+               " offset=" + DoubleToString(InpBE_Offset, 1) : "OFF"));
+   DiagWrite("Filters: DirLimit=" + (InpUseDirLimit ? "ON max=" + IntegerToString(InpMaxSameDirLosses) : "OFF") +
+             " | Trend=" + (InpUseTrendFilter ? "ON" : "OFF") +
+             " | ADR=" + (InpUseADRFilter ? "ON min=" + DoubleToString(InpMinADR, 1) : "OFF") +
+             " | Cooldown=" + IntegerToString(InpCooldownSeconds) + "s" +
+             " | GlobalCD=" + IntegerToString(InpGlobalCooldown) + "s");
+   DiagWrite("Window: " + IntegerToString(InpActiveStartHour) + ":" +
+             StringFormat("%02d", InpActiveStartMin) + " - " +
+             IntegerToString(InpActiveEndHour) + ":" +
+             StringFormat("%02d", InpActiveEndMin) +
+             " | BlockedDays=" + InpBlockedDays);
+}
+
+void CloseDiagLog()
+{
+   if(g_diagLogHandle != INVALID_HANDLE)
+   {
+      DiagWrite("=== EA STOPPED ===");
+      FileClose(g_diagLogHandle);
+      g_diagLogHandle = INVALID_HANDLE;
+   }
+}
+
+void DiagWrite(string msg)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   string line = TimeToString(TimeCurrent(), TIME_DATE | TIME_SECONDS) + " | " + msg;
+   FileWriteString(g_diagLogHandle, line + "\n");
+   FileFlush(g_diagLogHandle);
+}
+
+void DiagLogSessionStart()
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   DiagWrite("--- NEW SESSION ---" +
+             " Start=" + TimeToString(g_todaySessionStart, TIME_DATE | TIME_SECONDS) +
+             " End=" + TimeToString(g_todaySessionEnd, TIME_DATE | TIME_SECONDS));
+   DiagWrite("Session reset: tradesToday=0" +
+             " | consLongLosses=0 | consShortLosses=0" +
+             " | longBlocked=false | shortBlocked=false" +
+             " | tradedZones=0");
+   if(InpUseADRFilter)
+      DiagWrite("ADR=" + DoubleToString(g_currentADR, 2) +
+                " | minADR=" + DoubleToString(InpMinADR, 1) +
+                " | effectiveMaxTrades=" + IntegerToString(GetEffectiveMaxTrades()));
+}
+
+void DiagLogProfileStatus(string context)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   if(g_currentProfile.isValid)
+      DiagWrite("Profile " + context + ": VALID" +
+                " | VWAP=" + DoubleToString(g_vwap, _Digits) +
+                " | POC=" + DoubleToString(g_currentProfile.pocPrice, _Digits) +
+                " | Delta=" + DoubleToString(g_cumDelta, 0) +
+                " | Levels=" + IntegerToString(g_currentProfile.levelCount) +
+                " | HVNs=" + IntegerToString(CountHVNs(g_currentProfile)));
+   else
+      DiagWrite("Profile " + context + ": INVALID (no ticks yet or below threshold)");
+}
+
+int CountHVNs(const DailyProfile &prof)
+{
+   int count = 0;
+   for(int i = 0; i < prof.levelCount; i++)
+      if(prof.levels[i].isHVN) count++;
+   return count;
+}
+
+void DiagLogHeartbeat()
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   if(InpDiagHeartbeatMin <= 0) return;
+
+   datetime now = TimeCurrent();
+   if(g_lastHeartbeat > 0 && (now - g_lastHeartbeat) < InpDiagHeartbeatMin * 60)
+      return;
+   g_lastHeartbeat = now;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   DiagWrite("HEARTBEAT: bid=" + DoubleToString(bid, _Digits) +
+             " | profile=" + (g_currentProfile.isValid ? "VALID" : "INVALID") +
+             " | VWAP=" + DoubleToString(g_vwap, _Digits) +
+             " | trades=" + IntegerToString(g_tradesToday) + "/" + IntegerToString(GetEffectiveMaxTrades()) +
+             " | managed=" + (g_managedTicket > 0 ? "#" + IntegerToString(g_managedTicket) +
+               (g_managedDir > 0 ? " LONG" : " SHORT") +
+               " SL=" + DoubleToString(g_currentSL, _Digits) +
+               " BE=" + (g_beApplied ? "Y" : "N") : "none") +
+             " | longLosses=" + IntegerToString(g_consLongLosses) +
+               (g_longBlocked ? "(BLOCKED)" : "") +
+             " | shortLosses=" + IntegerToString(g_consShortLosses) +
+               (g_shortBlocked ? "(BLOCKED)" : ""));
+}
+
+void DiagLogPreFilter(string reason)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   static datetime s_lastPrefilterLog = 0;
+   static string   s_lastPrefilterReason = "";
+   static int      s_prefilterRepeatCount = 0;
+
+   datetime now = TimeCurrent();
+
+   if(reason == s_lastPrefilterReason && s_lastPrefilterLog > 0 &&
+      (now - s_lastPrefilterLog) < 60)
+   {
+      s_prefilterRepeatCount++;
+      return;
+   }
+
+   if(s_prefilterRepeatCount > 0 && s_lastPrefilterReason != "")
+      DiagWrite("PREFILTER: " + s_lastPrefilterReason +
+                " (repeated x" + IntegerToString(s_prefilterRepeatCount) + " since last log)");
+
+   DiagWrite("PREFILTER: " + reason);
+   s_lastPrefilterLog = now;
+   s_lastPrefilterReason = reason;
+   s_prefilterRepeatCount = 0;
+}
+
+void DiagLogStopMove(string type, double oldSL, double newSL, double entryPrice, double currentPrice)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   double distFromEntry = MathAbs(newSL - entryPrice);
+   DiagWrite("STOP_MOVE: " + type +
+             " | oldSL=" + DoubleToString(oldSL, _Digits) +
+             " | newSL=" + DoubleToString(newSL, _Digits) +
+             " | entry=" + DoubleToString(entryPrice, _Digits) +
+             " | price=" + DoubleToString(currentPrice, _Digits) +
+             " | distFromEntry=" + DoubleToString(distFromEntry, 1) + " pts");
+}
+
+void DiagLogTradeOpen(int dir, double entry, double sl, double tp1, double tp2, int score, double lots)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   DiagWrite("TRADE_OPEN: " + (dir > 0 ? "LONG" : "SHORT") +
+             " | entry=" + DoubleToString(entry, _Digits) +
+             " | SL=" + DoubleToString(sl, _Digits) +
+             " (" + DoubleToString(MathAbs(entry - sl), 1) + " pts)" +
+             " | TP1=" + DoubleToString(tp1, _Digits) +
+             " (" + DoubleToString(MathAbs(tp1 - entry), 1) + " pts)" +
+             " | TP2=" + (tp2 > 0 ? DoubleToString(tp2, _Digits) : "none") +
+             " | score=" + IntegerToString(score) +
+             " | lots=" + DoubleToString(lots, 2) +
+             " | tradeNum=" + IntegerToString(g_tradesToday));
+}
+
+void DiagLogTradeClose(string result, double entryPrice, double closePrice, double profit, double durationMin)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   DiagWrite("TRADE_CLOSE: " + result +
+             " | entry=" + DoubleToString(entryPrice, _Digits) +
+             " | close=" + DoubleToString(closePrice, _Digits) +
+             " | PnL=" + DoubleToString(profit, 2) +
+             " | duration=" + DoubleToString(durationMin, 1) + " min" +
+             " | finalSL=" + DoubleToString(g_currentSL, _Digits) +
+             " | wasBE=" + (g_beApplied ? "Y" : "N"));
+}
+
+void DiagLogDirLoss(int dir, int consLosses, bool blocked)
+{
+   if(g_diagLogHandle == INVALID_HANDLE) return;
+   DiagWrite("DIR_LOSS: " + (dir > 0 ? "LONG" : "SHORT") +
+             " | consecutive=" + IntegerToString(consLosses) +
+             " | max=" + IntegerToString(InpMaxSameDirLosses) +
+             " | blocked=" + (blocked ? "YES" : "no"));
 }
 //+------------------------------------------------------------------+

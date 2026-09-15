@@ -1021,9 +1021,10 @@ void ExportSingleProfile(DailyProfile &profile, string suffix)
    TimeToStruct(profile.sessionStart, dt);
 
    string dateStr = StringFormat("%04d-%02d-%02d", dt.year, dt.mon, dt.day);
+   string magicStr = IntegerToString(InpMagic);
    string fileName = InpCSVFolder + "\\" + _Symbol + "_" + dateStr;
    if(suffix != "") fileName += "_" + suffix;
-   fileName += "_profile.csv";
+   fileName += "_" + magicStr + "_profile.csv";
 
    int handle = FileOpen(fileName, FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
    if(handle == INVALID_HANDLE)
@@ -2231,7 +2232,7 @@ void CheckBreakeven()
 //+------------------------------------------------------------------+
 void OpenSignalLog()
 {
-   string filename = InpSignalLogFolder + "\\SignalLog_" + _Symbol + ".csv";
+   string filename = InpSignalLogFolder + "\\SignalLog_" + _Symbol + "_" + IntegerToString(InpMagic) + ".csv";
 
    g_signalLogHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_CSV | FILE_COMMON, ',');
    if(g_signalLogHandle == INVALID_HANDLE)
@@ -2579,7 +2580,7 @@ void OpenDiagLog()
 {
    if(!InpDiagLog) return;
 
-   string filename = InpSignalLogFolder + "\\DiagLog_" + _Symbol + ".log";
+   string filename = InpSignalLogFolder + "\\DiagLog_" + _Symbol + "_" + IntegerToString(InpMagic) + ".log";
    g_diagLogHandle = FileOpen(filename, FILE_READ | FILE_WRITE | FILE_TXT | FILE_COMMON);
    if(g_diagLogHandle == INVALID_HANDLE)
    {

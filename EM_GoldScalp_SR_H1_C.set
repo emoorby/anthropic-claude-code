@@ -1,0 +1,36 @@
+; EM_GoldScalp_SR - XAUUSD H1 - equivalent of EM_ScalpH1_C.set (Ultimate Breakout System V7.4, S/R entry)
+; === General ===
+InpMagic=2103
+InpComment=Gold_Scalp_C
+InpLots=0.1||0.01||0.01||1.0||N
+InpAllowBuy=true||false||0||true||N
+InpAllowSell=true||false||0||true||N
+InpPipSize=0.01
+; === Support/Resistance entry ===
+InpLevelTF=16385
+InpCheckTF=5
+InpLeftBars=20||5||1||30||N
+InpRightBars=1||1||1||3||N
+InpCountback=50||10||5||250||N
+InpMinDistPips=2000||100||100||5000||N
+InpBuyOffsetPips=-200||-300||25||200||N
+InpSellOffsetPips=-200||-300||25||200||N
+InpExpiryHours=205||10||5||240||N
+; === Exits ===
+InpStopPips=300||100||50||2000||N
+InpTakePips=1000||200||100||3000||N
+InpTrailStartPips=80||20||10||500||N
+InpTrailDistPips=80||20||10||500||N
+InpTrailStepPips=0.4||0.4||0.4||10||N
+; === NFP filter ===
+InpNfpFilter=true||false||0||true||N
+InpNfpServerTime=15:30
+InpNfpMinsBefore=50||10||10||120||N
+InpNfpMinsAfter=30||10||10||120||N
+InpNfpCloseTrades=true||false||0||true||N
+InpNfpDeletePending=true||false||0||true||N
+InpNfpCacheFile=EM_NFP_Dates.csv
+; === Optimisation ===
+InpOptMinPayoff=0
+InpOptMinRecovery=0
+InpOptMinTrades=0

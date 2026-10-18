@@ -6,7 +6,7 @@
 //|  EA's tester orders (133/133 placements reproduced).             |
 //+------------------------------------------------------------------+
 #property copyright "EM"
-#property version   "1.00"
+#property version   "1.10"
 #property description "Pending stop orders at the most recent unbroken H1 swing high/low,"
 #property description "fixed SL/TP, per-tick trailing stop and an NFP news filter."
 
@@ -15,13 +15,22 @@
 //--- Distances are in "pips" exactly like the original EA: 1 pip = InpPipSize in price.
 //--- On 2-digit gold 1 pip = 0.01, so 300 pips = $3.00.
 
+   enum     RiskMode          {Fixed_Lots=0, Risk_Percent=1};
+
 input group "=== General ==="
    input    long              InpMagic             = 2103;           // Magic number
    input    string            InpComment           = "Gold_Scalp_C"; // Trade comment
-   input    double            InpLots              = 0.1;            // Fixed lot size
    input    bool              InpAllowBuy          = true;           // Allow buy trades
    input    bool              InpAllowSell         = true;           // Allow sell trades
    input    double            InpPipSize           = 0.01;           // Price value of 1 pip (0.01 on 2-digit gold)
+   input    bool              InpLogFills          = true;           // Live only: log fill slippage to Common\Files
+
+input group "=== Position size ==="
+   input    RiskMode          InpRiskMode          = Fixed_Lots;     // Fixed lots or % of balance
+   input    double            InpLots              = 0.1;            // Fixed lot size
+   input    double            InpRiskPercent       = 1.0;            // Risk per trade (% of balance)
+   input    double            InpRiskBufferPips    = 50;             // Extra pips added to the stop for sizing (slippage)
+   input    double            InpMaxLots           = 5.0;            // Maximum lot size
 
 input group "=== Support/Resistance entry ==="
    input    ENUM_TIMEFRAMES   InpLevelTF           = PERIOD_H1;      // Timeframe for swing highs/lows
@@ -44,7 +53,7 @@ input group "=== Exits ==="
    input    double            InpTakePips          = 1000;           // Initial take profit (pips)
    input    double            InpTrailStartPips    = 80;             // Trailing starts at profit (pips, 0 = off)
    input    double            InpTrailDistPips     = 80;             // Trailing distance (pips)
-   input    double            InpTrailStepPips     = 0.4;            // Trailing step (pips)
+   input    double            InpTrailStepPips     = 10;             // Trailing step (pips)
 
 input group "=== NFP filter ==="
    input    bool              InpNfpFilter         = true;           // Enable NFP filter
@@ -86,7 +95,8 @@ bool     g_nfpHandled    = false;
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   if(InpPipSize<=0 || InpLeftBars<1 || InpRightBars<1 || InpCountback<=InpRightBars)
+   if(InpPipSize<=0 || InpLeftBars<1 || InpRightBars<1 || InpCountback<=InpRightBars || InpStopPips<=0 ||
+      (InpRiskMode==Fixed_Lots ? InpLots<=0 : (InpRiskPercent<=0 || InpRiskBufferPips<0)) || InpMaxLots<=0)
    {
       Print("Invalid inputs");
       return INIT_PARAMETERS_INCORRECT;
@@ -154,7 +164,11 @@ void OnTradeTransaction(const MqlTradeTransaction &trans,const MqlTradeRequest &
    {
       if(!HistoryDealSelect(trans.deal) || HistoryDealGetInteger(trans.deal,DEAL_MAGIC)!=InpMagic) return;
       ENUM_DEAL_ENTRY entry = (ENUM_DEAL_ENTRY)HistoryDealGetInteger(trans.deal,DEAL_ENTRY);
-      if(entry==DEAL_ENTRY_IN)                       { g_posTicket = trans.position; g_posPeakSL = 0; }
+      if(entry==DEAL_ENTRY_IN)
+      {
+         g_posTicket = trans.position; g_posPeakSL = 0;
+         if(InpLogFills && !g_tester) LogFill(trans.deal);
+      }
       else if(trans.position==g_posTicket)           { g_posTicket = 0;              g_posPeakSL = 0; }
    }
    else if(trans.type==TRADE_TRANSACTION_ORDER_DELETE)
@@ -292,17 +306,73 @@ bool PlacePending(bool buy,double entry,datetime swingTime)
    double stops = SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
    if(buy ? entry<=ask+stops : entry>=bid-stops) return false;
 
+   double lots = CalcLots(buy,entry);
+   if(lots<=0) return false;
+
    double margin;
-   if(!OrderCalcMargin(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,_Symbol,InpLots,entry,margin) ||
+   if(!OrderCalcMargin(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,_Symbol,lots,entry,margin) ||
       margin>AccountInfoDouble(ACCOUNT_MARGIN_FREE))
       return false;
 
    double sl = Norm(buy ? entry-g_sl : entry+g_sl);
    double tp = InpTakePips>0 ? Norm(buy ? entry+g_tp : entry-g_tp) : 0;
-   bool ok = buy ? trade.BuyStop (InpLots,entry,_Symbol,sl,tp,ORDER_TIME_GTC,0,InpComment)
-                 : trade.SellStop(InpLots,entry,_Symbol,sl,tp,ORDER_TIME_GTC,0,InpComment);
+   bool ok = buy ? trade.BuyStop (lots,entry,_Symbol,sl,tp,ORDER_TIME_GTC,0,InpComment)
+                 : trade.SellStop(lots,entry,_Symbol,sl,tp,ORDER_TIME_GTC,0,InpComment);
    if(ok) GlobalVariableSet(SwingKey(trade.ResultOrder()),(double)swingTime);
    return ok;
+}
+
+//--- Fixed lots, or lots that lose InpRiskPercent of balance if the stop (plus a slippage buffer) is hit.
+//--- Size is set when the pending order is placed. Returns 0 if even the minimum lot risks too much.
+double CalcLots(bool buy,double entry)
+{
+   double minLot = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN);
+   double maxLot = MathMin(SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX),InpMaxLots);
+   double step   = SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
+   double lots   = InpLots;
+
+   if(InpRiskMode==Risk_Percent)
+   {
+      double dist = g_sl + InpRiskBufferPips*g_pip;
+      double loss1;                                               // loss of 1 lot over dist, in account currency
+      if(!OrderCalcProfit(buy ? ORDER_TYPE_BUY : ORDER_TYPE_SELL,_Symbol,1.0,entry,buy ? entry-dist : entry+dist,loss1) || loss1>=0)
+         return 0;
+      double risk = AccountInfoDouble(ACCOUNT_BALANCE)*InpRiskPercent/100.0;
+      lots = MathFloor(risk/-loss1/step+1e-9)*step;
+      if(lots<minLot)
+      {
+         static datetime warned = 0;
+         if(TimeCurrent()-warned>=86400)
+         {
+            PrintFormat("Risk %.2f%% is below the minimum lot (%.2f) for a %.0f-pip stop: orders skipped",InpRiskPercent,minLot,InpStopPips+InpRiskBufferPips);
+            warned = TimeCurrent();
+         }
+         return 0;
+      }
+   }
+   lots = MathMax(minLot,MathMin(maxLot,lots));
+   return NormalizeDouble(MathRound(lots/step)*step,8);
+}
+
+//--- Live only: one CSV line per fill so slippage can be compared between brokers.
+void LogFill(ulong deal)
+{
+   ulong  order = (ulong)HistoryDealGetInteger(deal,DEAL_ORDER);
+   if(!HistoryOrderSelect(order)) return;
+   bool   buy   = HistoryDealGetInteger(deal,DEAL_TYPE)==DEAL_TYPE_BUY;
+   double req   = HistoryOrderGetDouble(order,ORDER_PRICE_OPEN);
+   double fill  = HistoryDealGetDouble(deal,DEAL_PRICE);
+   double slip  = buy ? fill-req : req-fill;                      // positive = worse than requested
+
+   string file = "EM_GoldScalp_Fills_"+AccountInfoString(ACCOUNT_COMPANY)+".csv";
+   StringReplace(file," ","_");
+   int h = FileOpen(file,FILE_READ|FILE_WRITE|FILE_CSV|FILE_ANSI|FILE_COMMON,',');
+   if(h==INVALID_HANDLE) return;
+   if(FileSize(h)==0) FileWrite(h,"time","side","requested","filled","slippage","lots");
+   FileSeek(h,0,SEEK_END);
+   FileWrite(h,TimeToString((datetime)HistoryDealGetInteger(deal,DEAL_TIME),TIME_DATE|TIME_SECONDS),buy ? "buy" : "sell",
+             DoubleToString(req,_Digits),DoubleToString(fill,_Digits),DoubleToString(slip,_Digits),DoubleToString(HistoryDealGetDouble(deal,DEAL_VOLUME),2));
+   FileClose(h);
 }
 
 void DeleteAllPending()

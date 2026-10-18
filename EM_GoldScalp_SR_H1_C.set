@@ -2,10 +2,16 @@
 ; === General ===
 InpMagic=2103
 InpComment=Gold_Scalp_C
-InpLots=0.1||0.01||0.01||1.0||N
 InpAllowBuy=true||false||0||true||N
 InpAllowSell=true||false||0||true||N
 InpPipSize=0.01
+InpLogFills=true||false||0||true||N
+; === Position size ===
+InpRiskMode=0
+InpLots=0.1||0.01||0.01||1.0||N
+InpRiskPercent=1.0||0.25||0.25||3.0||N
+InpRiskBufferPips=50||0||10||200||N
+InpMaxLots=5.0
 ; === Support/Resistance entry ===
 InpLevelTF=16385
 InpCheckTF=5
@@ -25,7 +31,7 @@ InpStopPips=300||100||50||2000||N
 InpTakePips=1000||200||100||3000||N
 InpTrailStartPips=80||20||10||500||N
 InpTrailDistPips=80||20||10||500||N
-InpTrailStepPips=0.4||0.4||0.4||10||N
+InpTrailStepPips=10||0.4||0.4||20||N
 ; === NFP filter ===
 InpNfpFilter=true||false||0||true||N
 InpNfpServerTime=15:30

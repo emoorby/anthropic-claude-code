@@ -21,6 +21,22 @@ It has 30 inputs instead of about 200.
 
 **How well it matches:** 133 of 133 pending orders from July to October 2026 (OHLC report), with no extra or missing orders. All 176 cancellations in both reports are explained by replacement, NFP or the end of the test.
 
+## Position size
+
+- `InpRiskMode=Fixed_Lots` uses `InpLots`.
+- `InpRiskMode=Risk_Percent` sizes each order so that a loss of `InpStopPips + InpRiskBufferPips` costs `InpRiskPercent` of the balance. With the defaults that distance is 350 pips ($3.50), the $3.00 stop plus a $0.50 allowance for slippage. The loss is valued with `OrderCalcProfit`, so currency conversion is handled for non-USD accounts.
+- The size is fixed when the pending order is placed. An order that is waiting while the balance changes keeps its original size, which is a difference of about 1-2% after a trade or two.
+- Lots are capped by `InpMaxLots` and the broker's maximum. If even the minimum lot would risk more than the set percentage, the order is skipped and a warning is logged once a day.
+- Examples on a $10,000 account: 1% gives 0.28 lots, 0.5% gives 0.14 lots.
+
+## Trailing step
+
+The default is 10 pips ($0.10). An optimisation of 197 passes (steps 0.4 to 20 pips, Vantage, random delays) showed no measurable effect on profit. 10 pips sends about 90% fewer stop modifications than 0.4.
+
+## Fill log (live only)
+
+Each entry fill is appended to `Common\Files\EM_GoldScalp_Fills_<broker>.csv` with the requested price, filled price and slippage. Use it to compare execution between brokers during forward tests.
+
 ## Session filter (optional, off by default)
 
 If `InpUseSession=true`, pending orders exist only between `InpSessionStartHour` and `InpSessionEndHour` (server time). Outside that window they are deleted at the next M5 check. Open trades are still managed normally.

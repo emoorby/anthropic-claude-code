@@ -34,6 +34,11 @@ input group "=== Support/Resistance entry ==="
    input    double            InpSellOffsetPips    = -200;           // Extra pips below low for sell entry
    input    int               InpExpiryHours       = 205;            // Pending order expiry in hours (0 = none)
 
+input group "=== Session filter ==="
+   input    bool              InpUseSession        = false;          // Only hold pending orders inside session
+   input    int               InpSessionStartHour  = 10;             // Session start hour (server time)
+   input    int               InpSessionEndHour    = 20;             // Session end hour (server time, exclusive)
+
 input group "=== Exits ==="
    input    double            InpStopPips          = 300;            // Initial stop loss (pips)
    input    double            InpTakePips          = 1000;           // Initial take profit (pips)
@@ -165,6 +170,8 @@ void OnCheckBar(datetime now,bool nfp)
 
    datetime lb = iTime(_Symbol,InpLevelTF,0);
    if(lb!=g_lastLevelBar && BuildSwings()) g_lastLevelBar = lb;
+
+   if(InpUseSession && !InSession(now)) { DeleteAllPending(); return; }   // pending orders only live inside the session
 
    RefreshPosition();
    if(nfp || g_posTicket!=0) return;            // no new orders during NFP or while in a trade
@@ -451,6 +458,13 @@ string NextNfpText(datetime now)
 //| Helpers                                                           |
 //+------------------------------------------------------------------+
 datetime TimeDay(datetime t)  { return t-(t%86400); }
+
+bool InSession(datetime t)
+{
+   int h = (int)((t%86400)/3600);
+   return InpSessionStartHour<=InpSessionEndHour ? (h>=InpSessionStartHour && h<InpSessionEndHour)
+                                                 : (h>=InpSessionStartHour || h<InpSessionEndHour);   // overnight session
+}
 string   SwingKey(ulong order){ return StringFormat("EMGS_%I64d_%I64u",InpMagic,order); }
 
 double Norm(double price)

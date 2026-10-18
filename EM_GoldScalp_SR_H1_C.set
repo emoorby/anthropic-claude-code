@@ -16,6 +16,10 @@ InpMinDistPips=2000||100||100||5000||N
 InpBuyOffsetPips=-200||-300||25||200||N
 InpSellOffsetPips=-200||-300||25||200||N
 InpExpiryHours=205||10||5||240||N
+; === Session filter ===
+InpUseSession=false||false||0||true||N
+InpSessionStartHour=10||8||1||16||N
+InpSessionEndHour=20||16||1||23||N
 ; === Exits ===
 InpStopPips=300||100||50||2000||N
 InpTakePips=1000||200||100||3000||N

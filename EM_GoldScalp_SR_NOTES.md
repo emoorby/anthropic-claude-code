@@ -21,6 +21,10 @@ It has 30 inputs instead of about 200.
 
 **How well it matches:** 133 of 133 pending orders from July to October 2026 (OHLC report), with no extra or missing orders. All 176 cancellations in both reports are explained by replacement, NFP or the end of the test.
 
+## Session filter (optional, off by default)
+
+If `InpUseSession=true`, pending orders exist only between `InpSessionStartHour` and `InpSessionEndHour` (server time). Outside that window they are deleted at the next M5 check. Open trades are still managed normally.
+
 ## NFP dates
 
 - **Live chart:** the EA reads US Nonfarm Payrolls dates from the MQL5 calendar and caches them to `Common\Files\EM_NFP_Dates.csv`.

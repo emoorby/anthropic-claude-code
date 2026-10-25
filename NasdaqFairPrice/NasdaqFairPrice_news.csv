@@ -1,0 +1,14 @@
+# NasdaqFairPrice news file
+# Copy this file to: <MT5 data folder>\..\Common\Files\  (MT5: File > Open Data Folder, go up one level to Terminal, then Common\Files)
+# One event per line: date,time,label   (date YYYY-MM-DD, time HH:MM in NEW YORK time)
+# Lines starting with # are ignored.
+#
+# Pre-open events (between InpNewsModeEarliest and 09:30) switch on news mode for that day:
+#   fair price = price at the release, reversion trading starts at the release time.
+# Events at/after 09:30 are only used for the optional blackout (InpNewsBlackout).
+#
+# Format examples (remove the # and replace with real red-folder USD events from your calendar):
+# 2026-01-09,08:30,NFP
+# 2026-01-13,08:30,CPI
+# 2026-01-28,14:00,FOMC
+date,time,label

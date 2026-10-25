@@ -89,6 +89,15 @@ input int                 InpSwingLookback       = 30;                  // BOS: 
 input double              InpMinDistToFPMult     = 1.0;                 // Skip if distance to fair price < TP x this
 input bool                InpLayerOnlyOnBOS      = true;                // Extra position same direction only on BOS
 
+input group "=== Trend-day protection ==="
+input int                 InpDirStopLosses       = 1;                   // A: stop a direction after N losses in it today (0 = off)
+input bool                InpUseFPReset          = false;               // B: move fair price after consolidation + break away
+input int                 InpConsolBars          = 10;                  // B: consolidation length (bars)
+input double              InpConsolMaxRange      = 25.0;                // B: consolidation max high-low range (pts)
+input double              InpResetMinDist        = 38.0;                // B: consolidation must be this far from fair price (pts)
+input int                 InpMaxFPResets         = 3;                   // B: max fair price moves per day
+input bool                InpDirStopResetOnFP    = true;                // A+B: clear direction stops when fair price moves
+
 input group "=== Trade limits ==="
 input int                 InpMaxTradesPerDay     = 5;                   // Max entries per NY day
 input int                 InpMaxOpenPositions    = 3;                   // Max open positions at once
@@ -152,6 +161,9 @@ bool     g_sessionOpenSeen = false;
 bool     g_sessionClosed   = false;
 ulong    g_contTicket   = 0;
 int      g_tradesToday  = 0;
+int      g_fpResets     = 0;
+datetime g_dirStopFrom  = 0;
+string   g_fpLineName   = "";
 
 //--- guard state
 datetime g_guardDayKey   = 0;
@@ -184,7 +196,7 @@ int OnInit()
       Print("Stop loss and take profit inputs must be positive");
       return(INIT_PARAMETERS_INCORRECT);
      }
-   if(InpCombineBars < 1 || InpSwingStrength < 1 || InpSwingLookback < InpSwingStrength * 2 + 2)
+   if(InpCombineBars < 1 || InpSwingStrength < 1 || InpSwingLookback < InpSwingStrength * 2 + 2 || InpConsolBars < 2)
      {
       Print("Invalid displacement / swing settings");
       return(INIT_PARAMETERS_INCORRECT);
@@ -252,7 +264,7 @@ void OnTick()
 //+------------------------------------------------------------------+
 void OnNewBar(datetime t0)
   {
-   int need = MathMax(InpSwingLookback + InpSwingStrength + 3, InpCombineBars + 3);
+   int need = MathMax(MathMax(InpSwingLookback + InpSwingStrength + 3, InpCombineBars + 3), InpConsolBars + 3);
    MqlRates rates[];
    ArraySetAsSeries(rates, true);
    if(CopyRates(_Symbol, PERIOD_M1, 0, need, rates) < need)
@@ -324,6 +336,10 @@ void OnNewBar(datetime t0)
         }
       return;
      }
+
+   //--- option B: move fair price when price consolidates then breaks further away
+   if(InpUseFPReset && sigToday && g_fairPrice > 0 && InReversionWindow(sigMin) && g_fpResets < InpMaxFPResets)
+      CheckFairPriceReset(rates);
 
    //--- reversion
    if(InpUseReversion && sigToday && g_fairPrice > 0 && InReversionWindow(sigMin))
@@ -429,6 +445,11 @@ void EvaluateReversion(const MqlRates &rates[], datetime nyNow)
    if(InpLayerOnlyOnBOS && !bos && CountOpen(dir) > 0)
      {
       LogEvent("SKIP", dir, type, c1, 0, 0, 0, "layering needs BOS");
+      return;
+     }
+   if(InpDirStopLosses > 0 && CountDirLosses(dir) >= InpDirStopLosses)
+     {
+      LogEvent("SKIP", dir, type, c1, 0, 0, 0, "direction stopped after losses");
       return;
      }
 
@@ -803,6 +824,9 @@ void ResetDay(datetime nyDay, int nowMin)
    g_sessionOpenSeen = false;
    g_sessionClosed   = false;
    g_contTicket      = 0;
+   g_fpResets        = 0;
+   g_dirStopFrom     = 0;
+   g_fpLineName      = "";
    g_tradesToday     = CountEntriesSince(NYToServer(nyDay));
 
    //--- earliest pre-open news event today
@@ -871,6 +895,70 @@ int CountEntriesSince(datetime fromServer)
   }
 
 //+------------------------------------------------------------------+
+//| Losing trades in a direction today (since the last fair price    |
+//| move when InpDirStopResetOnFP is on)                             |
+//+------------------------------------------------------------------+
+int CountDirLosses(int dir)
+  {
+   datetime from = (g_dirStopFrom > 0) ? g_dirStopFrom : NYToServer(g_nyDay);
+   if(!HistorySelect(from, TimeCurrent() + 86400))
+      return(0);
+   int n = 0;
+   for(int i = HistoryDealsTotal() - 1; i >= 0; i--)
+     {
+      ulong d = HistoryDealGetTicket(i);
+      if(d == 0 || HistoryDealGetString(d, DEAL_SYMBOL) != _Symbol ||
+         HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic ||
+         HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_OUT)
+         continue;
+      double pl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_COMMISSION) +
+                  HistoryDealGetDouble(d, DEAL_SWAP);
+      if(pl >= 0)
+         continue;
+      //--- a sell deal closes a buy position
+      int pdir = (HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_SELL) ? 1 : -1;
+      if(pdir == dir)
+         n++;
+     }
+   return(n);
+  }
+
+//+------------------------------------------------------------------+
+//| Option B: price holds in a tight range away from fair price,     |
+//| then closes out of it further away -> fair price = that range    |
+//+------------------------------------------------------------------+
+void CheckFairPriceReset(const MqlRates &rates[])
+  {
+   int N = InpConsolBars;
+   double hi = rates[2].high, lo = rates[2].low;
+   for(int i = 3; i <= N + 1; i++)
+     {
+      hi = MathMax(hi, rates[i].high);
+      lo = MathMin(lo, rates[i].low);
+     }
+   if(hi - lo > InpConsolMaxRange)
+      return;
+
+   double c1 = rates[1].close;
+   bool up   = (lo > g_fairPrice && c1 > hi && c1 > rates[1].open);
+   bool down = (hi < g_fairPrice && c1 < lo && c1 < rates[1].open);
+   if(!up && !down)
+      return;
+
+   double mid = (hi + lo) / 2.0;
+   if(MathAbs(mid - g_fairPrice) < InpResetMinDist)
+      return;
+
+   double old = g_fairPrice;
+   g_fpResets++;
+   SetFairPrice(NormPrice(mid), rates[N + 1].time);
+   if(InpDirStopResetOnFP)
+      g_dirStopFrom = rates[0].time;
+   LogEvent("FP_RESET", up ? 1 : -1, "", g_fairPrice, 0, 0, 0,
+            "fair price moved from " + DoubleToString(old, _Digits) + " (move " + IntegerToString(g_fpResets) + ")");
+  }
+
+//+------------------------------------------------------------------+
 void SetFairPrice(double price, datetime barServer)
   {
    g_fairPrice   = price;
@@ -878,7 +966,14 @@ void SetFairPrice(double price, datetime barServer)
    if(!InpDrawFairPrice || g_isOptim)
       return;
 
-   string name = "NFP_FP_" + TimeToString(g_nyDay, TIME_DATE);
+   //--- end the previous line where the new fair price takes over
+   datetime nowBar = iTime(_Symbol, PERIOD_M1, 0);
+   if(g_fpLineName != "" && ObjectFind(0, g_fpLineName) >= 0)
+      ObjectMove(0, g_fpLineName, 1, nowBar, ObjectGetDouble(0, g_fpLineName, OBJPROP_PRICE, 0));
+
+   string name = "NFP_FP_" + TimeToString(g_nyDay, TIME_DATE) + "_" + IntegerToString(g_fpResets) +
+                 (g_newsFPSet ? "n" : "");
+   g_fpLineName = name;
    datetime to = NYToServer(g_nyDay + g_sessEnd * 60);
    ObjectDelete(0, name);
    if(ObjectCreate(0, name, OBJ_TREND, 0, barServer, price, to, price))
@@ -1073,7 +1168,11 @@ void ShowPanel()
    string s = "NasdaqFairPrice\n";
    s += "New York: " + TimeToString(ny, TIME_DATE | TIME_MINUTES) + "\n";
    s += "Fair price: " + (g_fairPrice > 0 ? DoubleToString(g_fairPrice, _Digits) : "-") +
-        (g_newsFPSet ? "  (news: " + g_newsName + ")" : "") + "\n";
+        (g_newsFPSet ? "  (news: " + g_newsName + ")" : "") +
+        (g_fpResets > 0 ? "  (moved " + IntegerToString(g_fpResets) + "x)" : "") + "\n";
+   if(InpDirStopLosses > 0 && g_fairPrice > 0)
+      s += "Direction stops: longs " + (CountDirLosses(1) >= InpDirStopLosses ? "STOPPED" : "ok") +
+           ", shorts " + (CountDirLosses(-1) >= InpDirStopLosses ? "STOPPED" : "ok") + "\n";
    s += "Trades today: " + IntegerToString(g_tradesToday) + " / " + IntegerToString(InpMaxTradesPerDay) +
         "   Open: " + IntegerToString(CountOpen(0)) + " / " + IntegerToString(g_maxOpen) + "\n";
    if(InpDailyLossPct > 0)

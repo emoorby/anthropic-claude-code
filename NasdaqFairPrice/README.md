@@ -73,6 +73,32 @@ CSV format: `date,time,label`, e.g. `2026-03-11,08:30,CPI`. Times are in New Yor
 
 `Server = New York + 7h` is correct for brokers whose server runs GMT+2 in winter and GMT+3 in US summer, which is the usual setup at IC Markets and Vantage. When the EA starts, it prints the server time of today's 09:30 NY candle. **Check that this matches your chart** (it should be 16:30 server time). Otherwise switch the time model.
 
+## Trend-day protection
+
+On trend days price never returns to fair price, and fading it loses trade after trade. In the first backtest (Sep–Oct 2026) this produced a 20-loss streak and several days with no wins. There are two options, which can be used separately or together:
+
+**A. Direction stop** (`InpDirStopLosses`, default 1). After N losing trades in one direction today, the EA takes no more trades in that direction. The other direction is still allowed if price crosses fair price. 0 turns it off.
+
+**B. Fair price reset** (`InpUseFPReset`, default off). This is the transcript's rule: when price moves away, consolidates, then breaks further away, the old fair price is no longer fair. A reset happens when all of these are true:
+- the last `InpConsolBars` (10) candles sit in a range of `InpConsolMaxRange` (25 pts) or less;
+- that range is entirely on one side of fair price and at least `InpResetMinDist` (38 pts) from it;
+- a candle then closes out of the range, further away from fair price.
+
+Fair price then moves to the middle of that range, at most `InpMaxFPResets` times a day. Each move is logged as `FP_RESET` and drawn as a new line.
+
+With both on, `InpDirStopResetOnFP` clears the direction stops when fair price moves, because the old losses were against the old level.
+
+Test these four runs over the same period and compare:
+
+| Run | `InpDirStopLosses` | `InpUseFPReset` |
+|---|---|---|
+| Baseline | 0 | false |
+| A | 1 (then try 2) | false |
+| B | 0 | true |
+| A + B | 1 | true |
+
+The settings for B (10 bars, 25 pts) are first guesses. Optimise them only on part of your data, then check the result on a period they were not tuned on.
+
 ## Backtesting
 
 - Model: **Every tick based on real ticks**, on the broker you will trade.
@@ -82,7 +108,6 @@ CSV format: `date,time,label`, e.g. `2026-03-11,08:30,CPI`. Times are in New Yor
 
 ## Not implemented (by design for v1)
 
-- Moving fair price after consolidation and a break away from it (kept at 09:30, as requested).
 - Discretionary trades: Trump tweets, "pick a different account for this many points", copy trading.
 - Breakeven moves, apart from the optional *close continuation on opposite BOS*.
 - Firm-specific prop rules (consistency, minimum hold time, trailing drawdown). To be added once the firm is chosen.

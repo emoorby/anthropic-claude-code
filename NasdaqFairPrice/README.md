@@ -9,7 +9,8 @@ An Expert Adviser for the Nasdaq 100 CFD (IC Markets `USTEC`, Vantage `NAS100`) 
 | File | Where it goes |
 |---|---|
 | `NasdaqFairPrice.mq5` | `MQL5\Experts\` in your MT5 data folder. Compile in MetaEditor. |
-| `NasdaqFairPrice_news.csv` | `Terminal\Common\Files\` (the shared folder, so the Strategy Tester can read it). |
+| `NasdaqFairPrice_NewsExport.mq5` | `MQL5\Scripts\`. Run it once to fill the news CSV (see below). |
+| `NasdaqFairPrice_news.csv` | Template only. The export script writes the real file to `Terminal\Common\Files\`, the shared folder the Strategy Tester can read. |
 
 The trade log is written to `Terminal\Common\Files\NasdaqFairPrice_log_<symbol>.csv`.
 
@@ -40,6 +41,17 @@ If the CSV has an event between `InpNewsModeEarliest` (08:00) and 09:30 on a day
 - The 09:30 continuation is taken only if it points toward that fair price (`InpNewsContMode`).
 
 Events at or after 09:30 do nothing unless `InpNewsBlackout` is on. Then entries are blocked for a few minutes either side of the event.
+
+**Filling the CSV:**
+1. Compile `NasdaqFairPrice_NewsExport.mq5`.
+2. In a live or demo terminal (not the tester), drag it onto any chart and set the date range.
+3. It reads MT5's built-in economic calendar and writes `Common\Files\NasdaqFairPrice_news.csv`:
+   - high-impact USD events only;
+   - converted to New York time;
+   - events at the same time merged into one line;
+   - past events with no actual value (e.g. the cancelled October 2025 CPI) skipped.
+4. The Experts tab lists every event name it included. Use the *Exclude* input to drop any you don't want, e.g. `Jobless Claims`. Weekly claims would otherwise make every Thursday a news day.
+5. Re-run it every month or so to add upcoming events for live trading.
 
 CSV format: `date,time,label`, e.g. `2026-03-11,08:30,CPI`. Times are in New York time. Lines starting with `#` are ignored.
 

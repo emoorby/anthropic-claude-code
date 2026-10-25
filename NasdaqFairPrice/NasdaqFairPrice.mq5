@@ -59,7 +59,8 @@ input string              InpComment             = "NasdaqFP";          // Trade
 input group "=== Time (New York time, HH:MM) ==="
 input ENUM_TZ_MODE        InpTZMode              = TZ_NY_PLUS7;         // Broker server time model
 input int                 InpServerGMTOffset     = 2;                   // Server GMT offset (Fixed GMT mode only)
-input string              InpSessionStart        = "09:30";             // Session open / fair price candle
+input string              InpSessionStart        = "09:30";             // Session open / continuation candle
+input string              InpFairPriceTime       = "09:30";             // Fair price = open of this candle (at or before session open)
 input int                 InpContWindowMin       = 5;                   // Continuation window (minutes)
 input string              InpSessionEnd          = "11:00";             // No new entries from this time
 
@@ -140,7 +141,7 @@ input bool                InpWriteLog            = true;                // Write
 input color               InpFairPriceColor      = clrDodgerBlue;       // Fair price line colour
 
 //--- parsed settings
-int      g_sessStart, g_sessEnd, g_contEnd, g_newsEarliest;
+int      g_sessStart, g_sessEnd, g_contEnd, g_newsEarliest, g_fpTime;
 int      g_maxOpen;
 bool     g_isTester, g_isOptim;
 
@@ -154,6 +155,7 @@ datetime g_lastBar      = 0;
 double   g_fairPrice    = 0.0;
 datetime g_fpBarServer  = 0;
 bool     g_newsFPSet    = false;
+bool     g_anchorFPSet  = false;
 int      g_newsMin      = -1;
 datetime g_newsEventNY  = 0;
 string   g_newsName     = "";
@@ -180,12 +182,17 @@ int OnInit()
    g_isOptim  = (bool)MQLInfoInteger(MQL_OPTIMIZATION);
 
    if(!ParseHHMM(InpSessionStart, g_sessStart) || !ParseHHMM(InpSessionEnd, g_sessEnd) ||
-      !ParseHHMM(InpNewsModeEarliest, g_newsEarliest))
+      !ParseHHMM(InpNewsModeEarliest, g_newsEarliest) || !ParseHHMM(InpFairPriceTime, g_fpTime))
      {
       Print("Invalid time input. Use HH:MM, e.g. 09:30");
       return(INIT_PARAMETERS_INCORRECT);
      }
    g_contEnd = g_sessStart + MathMax(InpContWindowMin, 1);
+   if(g_fpTime > g_sessStart)
+     {
+      Print("Fair price time must be at or before the session open");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
    if(g_sessEnd <= g_contEnd)
      {
       Print("Session end must be after the continuation window");
@@ -293,11 +300,19 @@ void OnNewBar(datetime t0)
       LogEvent("NEWS_FP", 0, g_newsName, g_fairPrice, 0, 0, 0, "fair price set at news release");
      }
 
+   //--- fair price anchored before the open (InpFairPriceTime), unless news set it
+   if(sigToday && !g_anchorFPSet && !g_newsFPSet && g_fpTime < g_sessStart && sigMin >= g_fpTime && sigMin < g_sessStart)
+     {
+      SetFairPrice(rates[1].open, rates[1].time);
+      g_anchorFPSet = true;
+      LogEvent("ANCHOR_FP", 0, InpFairPriceTime, g_fairPrice, 0, 0, 0, "fair price set at " + InpFairPriceTime);
+     }
+
    //--- session open: fair price and continuation
    if(sigToday && !g_sessionOpenSeen && sigMin >= g_sessStart)
      {
       g_sessionOpenSeen = true;
-      if(!(g_newsFPSet && InpNewsKeepFairPrice))
+      if(!(g_newsFPSet && InpNewsKeepFairPrice) && !(g_anchorFPSet && !g_newsFPSet))
         {
          if(sigMin < g_contEnd)
             SetFairPrice(rates[1].open, rates[1].time);
@@ -818,6 +833,7 @@ void ResetDay(datetime nyDay, int nowMin)
    g_fairPrice       = 0;
    g_fpBarServer     = 0;
    g_newsFPSet       = false;
+   g_anchorFPSet     = false;
    g_newsMin         = -1;
    g_newsEventNY     = 0;
    g_newsName        = "";
@@ -857,10 +873,20 @@ void ResetDay(datetime nyDay, int nowMin)
          g_newsFPSet = true;
         }
      }
+   if(!g_newsFPSet && g_fpTime < g_sessStart && nowMin > g_fpTime + 1 && nowMin < g_sessEnd)
+     {
+      MqlRates r[];
+      datetime from = NYToServer(nyDay + g_fpTime * 60);
+      if(CopyRates(_Symbol, PERIOD_M1, from, from + 10 * 60, r) > 0)
+        {
+         SetFairPrice(r[0].open, r[0].time);
+         g_anchorFPSet = true;
+        }
+     }
    if(nowMin > g_sessStart + 1)
      {
       g_sessionOpenSeen = true;               // never take a late continuation
-      if(!(g_newsFPSet && InpNewsKeepFairPrice))
+      if(!(g_newsFPSet && InpNewsKeepFairPrice) && !(g_anchorFPSet && !g_newsFPSet))
          RecoverSessionFairPrice();
      }
   }
@@ -1168,7 +1194,7 @@ void ShowPanel()
    string s = "NasdaqFairPrice\n";
    s += "New York: " + TimeToString(ny, TIME_DATE | TIME_MINUTES) + "\n";
    s += "Fair price: " + (g_fairPrice > 0 ? DoubleToString(g_fairPrice, _Digits) : "-") +
-        (g_newsFPSet ? "  (news: " + g_newsName + ")" : "") +
+        (g_newsFPSet ? "  (news: " + g_newsName + ")" : (g_anchorFPSet ? "  (" + InpFairPriceTime + ")" : "")) +
         (g_fpResets > 0 ? "  (moved " + IntegerToString(g_fpResets) + "x)" : "") + "\n";
    if(InpDirStopLosses > 0 && g_fairPrice > 0)
       s += "Direction stops: longs " + (CountDirLosses(1) >= InpDirStopLosses ? "STOPPED" : "ok") +

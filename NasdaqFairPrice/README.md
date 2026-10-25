@@ -18,7 +18,7 @@ The trade log is written to `Terminal\Common\Files\NasdaqFairPrice_log_<symbol>.
 
 All times are **New York time**. All distances are **index points** (1.0 = one Nasdaq point), not MT5 `_Point`.
 
-1. **Fair price** = open of the 09:30 M1 candle.
+1. **Fair price** = open of the M1 candle at `InpFairPriceTime` (default 09:30). Set it earlier, e.g. 08:30 or 09:00, to anchor fair price to the pre-market price on every day. This only changes the level: reversion trading still starts at 09:35 on normal days, and the 09:30 continuation is unchanged. On news days the news release price takes priority.
 2. **Continuation (09:30 candle only).** When the 09:30 candle closes, enter in its colour.
    - Body ≤ 25 pts: SL 25 / TP 38.
    - Body > 25 pts: SL 50 / TP 76.

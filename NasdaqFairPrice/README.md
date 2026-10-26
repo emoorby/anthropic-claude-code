@@ -73,6 +73,22 @@ CSV format: `date,time,label`, e.g. `2026-03-11,08:30,CPI`. Times are in New Yor
 
 `Server = New York + 7h` is correct for brokers whose server runs GMT+2 in winter and GMT+3 in US summer, which is the usual setup at IC Markets and Vantage. When the EA starts, it prints the server time of today's 09:30 NY candle. **Check that this matches your chart** (it should be 16:30 server time). Otherwise switch the time model.
 
+## News days only
+
+`InpNewsDaysOnly` = true restricts all trading, continuation and reversion, to days with a pre-open event in the news file. These are the days where news mode sets fair price at the release. It needs the news file loaded and news mode on.
+
+## Take profit at fair price
+
+`InpTPMode`:
+- **Fixed points** (default): TP = `InpTP` (38).
+- **At fair price**: reversion trades target fair price itself, which is JJ's "live account" approach. Two settings refine it:
+  - `InpTPFairFraction` (1.0 = all the way, 0.5 = halfway);
+  - `InpTPFairBuffer` (stop 2 points short of fair price so the order fills).
+
+  The TP is never set closer than `InpTP`. Continuation trades always use their fixed TP. If fair price moves after entry, the TP of an open trade is not updated.
+
+With far targets, trades can stay open long after 11:00. Turn on *Close open trades at session end* when testing this mode.
+
 ## Trend-day protection
 
 On trend days price never returns to fair price, and fading it loses trade after trade. In the first backtest (Sep–Oct 2026) this produced a 20-loss streak and several days with no wins. There are two options, which can be used separately or together:

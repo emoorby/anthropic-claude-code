@@ -45,6 +45,12 @@ enum ENUM_NEWS_CONT_MODE
    NEWSCONT_SKIP      = 2  // Skip it
   };
 
+enum ENUM_TP_MODE
+  {
+   TP_FIXED = 0, // Fixed points (Take profit input)
+   TP_FAIR  = 1  // At fair price
+  };
+
 enum ENUM_DAY_RESET
   {
    RESET_SERVER_MIDNIGHT = 0, // Server midnight
@@ -80,6 +86,9 @@ input bool                InpUseReversion        = true;                // Trade
 input ENUM_SETUP_MODE     InpSetupMode           = SETUP_BOTH;          // Entry setups
 input double              InpSL                  = 25.0;                // Stop loss (pts)
 input double              InpTP                  = 38.0;                // Take profit (pts)
+input ENUM_TP_MODE        InpTPMode              = TP_FIXED;            // Take profit mode
+input double              InpTPFairFraction      = 1.0;                 // Fair price TP: fraction of the way (1 = all the way)
+input double              InpTPFairBuffer        = 2.0;                 // Fair price TP: stop short of it by (pts)
 input double              InpMinBody             = 3.0;                 // Displacement: min body (pts)
 input double              InpMinBodyExcess       = 0.0;                 // Displacement: body must beat previous by (pts)
 input double              InpMinBodyRangeRatio   = 0.5;                 // Displacement: min body / range (0-1)
@@ -130,6 +139,7 @@ input bool                InpUseNewsMode         = true;                // Pre-o
 input string              InpNewsModeEarliest    = "08:00";             // Earliest pre-open news time used
 input ENUM_NEWS_CONT_MODE InpNewsContMode        = NEWSCONT_TOWARD_FP;  // 09:30 continuation on news days
 input bool                InpNewsKeepFairPrice   = true;                // Keep pre-news fair price after 09:30
+input bool                InpNewsDaysOnly        = false;               // Only trade on days with pre-open news
 input bool                InpNewsBlackout        = false;               // Block entries around in-session news
 input int                 InpNewsBlackoutBefore  = 2;                   // Blackout minutes before
 input int                 InpNewsBlackoutAfter   = 2;                   // Blackout minutes after
@@ -209,6 +219,17 @@ int OnInit()
       return(INIT_PARAMETERS_INCORRECT);
      }
 
+   if(InpNewsDaysOnly && (!InpUseNewsFile || !InpUseNewsMode))
+     {
+      Print("News days only needs the news file and news mode switched on");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+   if(InpTPMode == TP_FAIR && (InpTPFairFraction <= 0 || InpTPFairFraction > 1.0))
+     {
+      Print("Fair price TP fraction must be above 0 and at most 1");
+      return(INIT_PARAMETERS_INCORRECT);
+     }
+
    g_maxOpen = MathMax(InpMaxOpenPositions, 1);
    if((ENUM_ACCOUNT_MARGIN_MODE)AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
      {
@@ -227,6 +248,11 @@ int OnInit()
 
    if(InpUseNewsFile)
       LoadNews();
+   if(InpNewsDaysOnly && ArraySize(g_newsNY) == 0)
+     {
+      Print("News days only is on but no news events were loaded");
+      return(INIT_FAILED);
+     }
 
    datetime now = TimeCurrent();
    datetime ny  = ToNY(now);
@@ -291,6 +317,7 @@ void OnNewBar(datetime t0)
       return;
 
    bool sigToday = (DayStart(nySig) == g_nyDay);
+   bool tradeDay = !(InpNewsDaysOnly && g_newsMin < 0);   // news days only: skip days without pre-open news
 
    //--- pre-open news: fair price = price at the release
    if(sigToday && !g_newsFPSet && g_newsMin >= 0 && sigMin >= g_newsMin && sigMin < g_sessStart)
@@ -320,7 +347,7 @@ void OnNewBar(datetime t0)
             RecoverSessionFairPrice();
          LogEvent("SESSION_FP", 0, "", g_fairPrice, 0, 0, 0, "");
         }
-      if(InpUseContinuation && sigMin == g_sessStart)
+      if(InpUseContinuation && sigMin == g_sessStart && tradeDay)
          DoContinuation(rates);
      }
 
@@ -357,7 +384,7 @@ void OnNewBar(datetime t0)
       CheckFairPriceReset(rates);
 
    //--- reversion
-   if(InpUseReversion && sigToday && g_fairPrice > 0 && InReversionWindow(sigMin))
+   if(InpUseReversion && tradeDay && sigToday && g_fairPrice > 0 && InReversionWindow(sigMin))
       EvaluateReversion(rates, nyNow);
   }
 
@@ -607,6 +634,9 @@ bool TryEnter(int dir, double slPts, double tpPts, string type, bool checkDist, 
          LogEvent("SKIP", dir, type, price, 0, 0, 0, "too close to fair price (" + DoubleToString(dist, 1) + ")");
          return(false);
         }
+      //--- target the fair price itself (never closer than the fixed TP)
+      if(InpTPMode == TP_FAIR)
+         tpPts = MathMax(InpTP, dist * InpTPFairFraction - InpTPFairBuffer);
      }
 
    double stopsLevel = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
@@ -1196,6 +1226,8 @@ void ShowPanel()
    s += "Fair price: " + (g_fairPrice > 0 ? DoubleToString(g_fairPrice, _Digits) : "-") +
         (g_newsFPSet ? "  (news: " + g_newsName + ")" : (g_anchorFPSet ? "  (" + InpFairPriceTime + ")" : "")) +
         (g_fpResets > 0 ? "  (moved " + IntegerToString(g_fpResets) + "x)" : "") + "\n";
+   if(InpNewsDaysOnly)
+      s += (g_newsMin >= 0 ? "News day: " + g_newsName : "Not a news day: no trading") + "\n";
    if(InpDirStopLosses > 0 && g_fairPrice > 0)
       s += "Direction stops: longs " + (CountDirLosses(1) >= InpDirStopLosses ? "STOPPED" : "ok") +
            ", shorts " + (CountDirLosses(-1) >= InpDirStopLosses ? "STOPPED" : "ok") + "\n";

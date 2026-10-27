@@ -1,0 +1,4 @@
+ticker,date,timing
+# Example rows (delete): date YYYY-MM-DD, timing BMO (before open) / AMC (after close) / blank
+NFLX,2025-01-21,AMC
+AAPL,2025-01-30,AMC

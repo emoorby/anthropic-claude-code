@@ -684,7 +684,7 @@ private:
       MqlTick tk;
       if(!SymbolInfoTick(sym, tk)) { dg[D_F_SPREAD]++; return false; }
       double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
-      int    dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
+      int    digits = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
       if(InpMaxSpreadPts > 0 && (tk.ask - tk.bid) / pt > InpMaxSpreadPts) { dg[D_F_SPREAD]++; return false; }
 
       double price = (dir > 0) ? tk.ask : tk.bid;
@@ -696,8 +696,8 @@ private:
       double lots = CalcLots(risk);
       if(lots <= 0) { dg[D_F_LOTS]++; return false; }
 
-      sl = NormalizeDouble((dir > 0) ? price - risk : price + risk, dg);
-      double tp = NormalizeDouble((dir > 0) ? price + risk * InpRR : price - risk * InpRR, dg);
+      sl = NormalizeDouble((dir > 0) ? price - risk : price + risk, digits);
+      double tp = NormalizeDouble((dir > 0) ? price + risk * InpRR : price - risk * InpRR, digits);
       string cmt = InpComment + " " + tag;
 
       trade.SetTypeFillingBySymbol(sym);

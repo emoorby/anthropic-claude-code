@@ -100,3 +100,38 @@ The edge depends on the previous day's high/low being a level where **institutio
 8. **Data quality at your broker.** Many brokers keep only 1–3 years of tick history for stock CFDs. Check the session times and how dividends and splits are handled. A basket you can't backtest properly is a basket you can't trust.
 9. **Market regime.** Breakout-retest strategies do best in trending, moderately volatile markets. Consider an index-level filter (e.g. only trade when the index's opening range is outside its previous day's range, or VIX within a band).
 10. **Possible extra filter: relative volume.** Stocks "in play" (first 15m volume ≫ average) follow through better. MT5 stock CFDs often only provide tick volume, so check what your broker supplies before relying on it.
+
+---
+
+# v2.1: data robustness, diagnostics, symbol selector
+
+Why: a PC vs VPS comparison of two "All symbols in Market Watch" runs showed the same ticker giving very different results. The EA, the inputs and the tester engine were consistent, so the cause was **different or incomplete history on each machine**. Many runs also produced no trades and never said why.
+
+## EA changes (`BreakAndBounce_EA.mq5` v2.10)
+* **No more silently lost days.** If the D1/M5/ATR data isn't ready when a day starts, the EA retries once a minute until the entry window closes. Before, it skipped the whole day.
+* **`InpMaxRangeAgeDays` (5).** If the "previous day" bar is older than this, there's a hole in the history. The day is skipped and counted as `stale_range`, instead of trading off weeks-old levels.
+* **Weekdays with no ticks at all** are counted as `no_data`, including from the test start. Patchy stock history becomes visible.
+* **Diagnostics for every symbol:** days, no_data, stale_range, range_filter, gap_skip, news_skip, earnings_skip, breakouts, setups, entries, and why entries were refused (spread, news, lots, max SL, basket caps, broker rejection plus the last retcode). Each symbol also gets a one-word **verdict**: `traded`, `NO_DATA`, `TRADE_REJECTED`, `LOT_TOO_BIG`, `no_breakouts`, `no_setups`, `filtered`.
+  * Single test → `Terminal\Common\Files\BB_symbol_stats.csv` (and the journal).
+  * Optimisation, including Market Watch mode → **`Terminal\Common\Files\BB_optim_diag.csv`**, one row per pass and symbol, collected via tester frames.
+  * Find it via *File → Open Data Folder*, go up one level, then `Common\Files`.
+* A warning is printed at start if a symbol's trade mode isn't FULL (e.g. close-only).
+* `InpSymbolsFromFile` reads the basket from `MQL5\Files\BB_symbols.txt`, which the selector script writes. Long lists don't fit in a string input.
+
+## `BB_SymbolSelector.mq5` (script)
+1. Picks every server symbol ending in `.NYSE` / `.NAS` (configurable) and drops names containing `-24`.
+2. Forces the history download and keeps only symbols whose data covers the test period:
+   * the first bar is within `InpEdgeDays` of the start and the last bar within that of the end (drops delisted symbols);
+   * there are ≥ `InpMinCoverPct` daily bars compared with the best symbol (drops patchy history);
+   * M1 bars exist at the start, and real ticks on the first and last day.
+3. Optional filters: FULL trade mode only, minimum price, ADR % band, top-N by average traded value. Real volume is used where the broker supplies it, otherwise tick volume as a proxy.
+4. Shows the passing symbols in Market Watch and hides the rest. Then writes `MQL5\Files\BB_symbol_check.csv` (every symbol and its pass/fail reason) and `BB_symbols.txt`.
+
+It can take a while for ~1,500 candidates, because each one's history is downloaded; progress shows in the chart corner. Save the result as a Market Watch set (right-click → Sets → Save as) so you don't have to run it every time.
+
+## Testing checklist
+1. Same machine, same dates, same `.set` file, same modelling ("Every tick based on real ticks" for final checks).
+2. Run `BB_SymbolSelector` first, with the **same dates** as the test.
+3. If a ticker still differs between machines, delete that machine's `Tester\Agent-*\bases\<server>\history\<symbol>` and `ticks\<symbol>` folders and re-run. They are rebuilt from the terminal's data.
+4. After a Market Watch optimisation, sort `BB_optim_diag.csv` by verdict. `NO_DATA` / `TRADE_REJECTED` rows are data or broker problems, not strategy results.
+5. Watch free disk space: each agent keeps its own copy of the tick history. Fewer agents means less disk.

@@ -11,17 +11,19 @@
 //|  share the same exchange session (run one basket per exchange).  |
 //+------------------------------------------------------------------+
 #property copyright "Break & Bounce EA"
-#property version   "2.00"
+#property version   "2.10"
 // Sent to tester agents (must exist in MQL5\Files; create with BB_ExportCalendar.mq5 / by hand)
 #property tester_file "BB_news.csv"
 #property tester_file "BB_earnings.csv"
+#property tester_file "BB_symbols.txt"
 
 #include <Trade\Trade.mqh>
 CTrade trade;
 
 #define NEWS_FILE  "BB_news.csv"
 #define EARN_FILE  "BB_earnings.csv"
-#define STATS_FILE "BB_symbol_stats.csv"
+#define STATS_FILE "BB_symbol_stats.csv"   // single test  -> Terminal\Common\Files
+#define DIAG_FILE  "BB_optim_diag.csv"     // optimisation -> Terminal\Common\Files
 
 //--- enums
 enum ENUM_RANGE_SRC   {RANGE_D1=0,         // Broker D1 bar (incl. overnight on CFDs)
@@ -49,6 +51,7 @@ enum ENUM_NEWS_MODE   {NEWS_OFF=0,         // Off
 //--- inputs
 input group "=== General / basket ==="
 input string          InpSymbols           = "";            // Symbols, comma separated (empty = chart)
+input bool            InpSymbolsFromFile   = false;         // Read symbols from BB_symbols.txt instead
 input ulong           InpMagic             = 240611;        // Magic number
 input string          InpComment           = "BreakBounce"; // Trade comment
 input bool            InpTradeLong         = true;          // Allow long setups
@@ -74,6 +77,7 @@ input int             InpRangeStartMin     = 30;            // Session range sta
 input int             InpRangeEndHour      = 23;            // Session range end hour
 input int             InpRangeEndMin       = 0;             // Session range end minute
 input bool            InpSkipSundayBar     = true;          // D1: skip Sunday stub bar
+input int             InpMaxRangeAgeDays   = 5;             // Skip day if prev bar is older than x days (data gap)
 input int             InpATRPeriod         = 14;            // D1 ATR period (range / gap filters)
 input double          InpMinRangeATR       = 0.0;           // Min prev range / ATR (0=off)
 input double          InpMaxRangeATR       = 0.0;           // Max prev range / ATR (0=off)
@@ -134,6 +138,24 @@ input int             InpMinTradesOpt      = 30;            // OnTester: min tra
 //--- shared state
 struct Trigger {bool active; int dir; double price; double sl; datetime expiry;};
 
+// Diagnostic counters: why a symbol did or didn't trade
+enum ENUM_DIAG {D_DAYS, D_NODATA, D_STALE, D_RANGEFILT, D_GAP, D_NEWS, D_EARN, D_BREAKOUT,
+                D_SETUP, D_ENTRY, D_F_SPREAD, D_F_NEWS, D_F_LOTS, D_F_MAXSL, D_F_CAPS, D_F_TRADE};
+#define D_COUNT 16
+string DG_NAMES[] = {"days", "no_data", "stale_range", "range_filter", "gap_skip", "news_skip",
+                            "earnings_skip", "breakouts", "setups", "entries", "f_spread", "f_news",
+                            "f_lots", "f_max_sl", "f_caps", "f_trade"};
+// Packed stats layout (FrameAdd payload / CSV row)
+#define PK_TRADES 0
+#define PK_WINS   1
+#define PK_NET    2
+#define PK_GP     3
+#define PK_GL     4
+#define PK_DIAG   5
+#define PK_RET    (PK_DIAG + D_COUNT)
+#define PK_MODE   (PK_RET + 1)
+#define PK_SIZE   (PK_MODE + 1)
+
 datetime g_news[];                    // sorted high-impact event times
 string   g_eTick[];                   // earnings file rows
 datetime g_eDate[];
@@ -176,6 +198,19 @@ int ReadRow(int h, string &f[])
 }
 
 bool IsDigitStart(string s) { return StringLen(s) > 0 && StringGetCharacter(s, 0) >= '0' && StringGetCharacter(s, 0) <= '9'; }
+
+string TradeModeName(long m)
+{
+   switch((int)m)
+   {
+      case SYMBOL_TRADE_MODE_DISABLED:  return "disabled";
+      case SYMBOL_TRADE_MODE_LONGONLY:  return "long_only";
+      case SYMBOL_TRADE_MODE_SHORTONLY: return "short_only";
+      case SYMBOL_TRADE_MODE_CLOSEONLY: return "close_only";
+      case SYMBOL_TRADE_MODE_FULL:      return "full";
+   }
+   return "unknown";
+}
 
 // true if any news event lies in [from, to] (binary search)
 bool NewsIn(datetime from, datetime to)
@@ -268,17 +303,27 @@ public:
    datetime breakFrom, lastBrkBar, lastBrkDone, lastSigBar, engDoneBar;
    double   hi, lo, prevClose, atrVal, unit;
    int      dir, tradesToday, openPos;
-   bool     rangeOk, blocked, gapChecked, needReset;
+   bool     rangeOk, rangePending, weekday, blocked, gapChecked, needReset;
+   datetime lastRangeTry;
    MqlRates p1;                       // last closed signal bar
    Trigger  trig;
    datetime earnDate[];
    int      earnTiming[];
+   int      dg[D_COUNT];              // diagnostics
+   uint     lastRet;                  // last rejected trade retcode
+   long     tradeMode;
 
-            CBB() : atr(INVALID_HANDLE), day(0), openPos(0) { ZeroMemory(p1); trig.active = false; }
+            CBB() : atr(INVALID_HANDLE), day(0), openPos(0), lastRet(0), rangeOk(false), rangePending(false), weekday(false)
+            { ZeroMemory(p1); trig.active = false; ArrayInitialize(dg, 0); }
 
    bool Init(string s)
    {
       sym = s;
+      datetime t0 = TimeCurrent();
+      day = t0 - t0 % 86400 - 86400;   // so missing days from the test start are counted too
+      tradeMode = SymbolInfoInteger(sym, SYMBOL_TRADE_MODE);
+      if(tradeMode != SYMBOL_TRADE_MODE_FULL)
+         PrintFormat("%s: trade mode is not FULL (%s) - entries may be rejected", sym, TradeModeName(tradeMode));
       if(InpMinRangeATR > 0 || InpMaxRangeATR > 0 || InpMaxGapATR > 0)
       {
          atr = iATR(sym, PERIOD_D1, InpATRPeriod);
@@ -297,11 +342,25 @@ public:
 
    void Release() { if(atr != INVALID_HANDLE) IndicatorRelease(atr); }
 
-   void CheckDay(datetime now) { datetime d = now - now % 86400; if(d != day) NewDay(d); }
+   // Weekdays with no ticks at all never reach NewDay (common with patchy stock CFD
+   // history), so count the skipped ones here as no-data days.
+   void CheckDay(datetime now)
+   {
+      datetime d = now - now % 86400;
+      if(d == day) return;
+      for(datetime x = day + 86400; day > 0 && x < d; x += 86400)
+      {
+         MqlDateTime t;
+         TimeToStruct(x, t);
+         if(t.day_of_week >= 1 && t.day_of_week <= 5) { dg[D_DAYS]++; dg[D_NODATA]++; }
+      }
+      NewDay(d);
+   }
 
    //--- main per-tick work (cheap early exits)
    void Tick(datetime now)
    {
+      if(rangePending) TryRange(now);
       if(!rangeOk || blocked || now < sessStart) return;
 
       datetime tb = iTime(sym, InpBreakTF, 0);
@@ -326,6 +385,7 @@ public:
 private:
    void NewDay(datetime d)
    {
+      if(rangePending && weekday) dg[D_NODATA]++;   // previous day never got its range
       day = d;
       dir = 0; tradesToday = 0;
       trig.active = false;
@@ -334,19 +394,43 @@ private:
       sessStart = d + InpOpenHour * 3600 + InpOpenMin * 60;
       winEnd    = sessStart + InpEntryWindowMins * 60;
       exitTime  = d + InpExitHour * 3600 + InpExitMin * 60;
-      rangeOk   = CalcRange(d);
-      if(!rangeOk) return;
+      MqlDateTime t;
+      TimeToStruct(d, t);
+      weekday = (t.day_of_week >= 1 && t.day_of_week <= 5);
+      if(weekday) dg[D_DAYS]++;
+      rangeOk = false; rangePending = true; lastRangeTry = 0;
+      TryRange(TimeCurrent());
+   }
+
+   // Builds the day's box. If history isn't loaded yet it retries (once a minute)
+   // until the entry window closes instead of silently losing the whole day.
+   void TryRange(datetime now)
+   {
+      if(now - lastRangeTry < 60) return;
+      lastRangeTry = now;
+
+      int rc = CalcRange(day);
+      if(rc < 0)
+      {
+         if(now < winEnd) return;
+         rangePending = false;
+         if(weekday) dg[D_NODATA]++;
+         return;
+      }
+      rangePending = false;
+      if(rc == 0) return;
+      rangeOk = true;
 
       unit = (InpUnits == UNITS_POINTS) ? SymbolInfoDouble(sym, SYMBOL_POINT) : (hi - lo) / 100.0;
 
       if((InpNewsMode == NEWS_SKIP_DAY || InpNewsMode == NEWS_BOTH) &&
-         NewsIn(sessStart - InpNewsPreOpenMins * 60, winEnd)) blocked = true;
-      if(InpUseEarnings && EarningsDay()) blocked = true;
+         NewsIn(sessStart - InpNewsPreOpenMins * 60, winEnd)) { blocked = true; if(weekday) dg[D_NEWS]++; }
+      if(!blocked && InpUseEarnings && EarningsDay())           { blocked = true; if(weekday) dg[D_EARN]++; }
 
       if(InpDrawLevels && sym == _Symbol && !MQLInfoInteger(MQL_OPTIMIZATION))
       {
-         string name = "BB_" + TimeToString(d, TIME_DATE);
-         ObjectCreate(0, name, OBJ_RECTANGLE, 0, d, hi, exitTime, lo);
+         string name = "BB_" + TimeToString(day, TIME_DATE);
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, day, hi, exitTime, lo);
          ObjectSetInteger(0, name, OBJPROP_COLOR, blocked ? clrIndianRed : clrSteelBlue);
          ObjectSetInteger(0, name, OBJPROP_BACK, true);
       }
@@ -363,15 +447,22 @@ private:
       return false;
    }
 
-   bool CalcRange(datetime d)
+   // 1 = ok, 0 = day filtered out, -1 = history not available (yet)
+   int CalcRange(datetime d)
    {
       int s = iBarShift(sym, PERIOD_D1, d - 1, false);   // last D1 bar before today
-      if(s < 0) return false;
+      if(s < 0) return -1;
       MqlDateTime dt;
       TimeToStruct(iTime(sym, PERIOD_D1, s), dt);
       if(InpSkipSundayBar && dt.day_of_week == 0) s++;
       prevDay = iTime(sym, PERIOD_D1, s);
-      if(prevDay == 0) return false;
+      if(prevDay == 0) return -1;
+      // A "previous day" weeks old means a hole in the history - its levels are meaningless
+      if(InpMaxRangeAgeDays > 0 && prevDay < d - InpMaxRangeAgeDays * 86400)
+      {
+         if(weekday) dg[D_STALE]++;
+         return 0;
+      }
 
       if(InpRangeSource == RANGE_D1)
       {
@@ -385,24 +476,27 @@ private:
          datetime to   = prevDay + InpRangeEndHour * 3600 + InpRangeEndMin * 60 - 1;
          MqlRates r[];
          int n = CopyRates(sym, PERIOD_M5, from, to, r);
-         if(n <= 0) return false;
+         if(n <= 0) return -1;
          hi = r[0].high; lo = r[0].low;
          for(int i = 1; i < n; i++) { hi = MathMax(hi, r[i].high); lo = MathMin(lo, r[i].low); }
          prevClose = r[n - 1].close;
       }
-      if(hi <= lo) return false;
+      if(hi <= lo) return -1;
 
       atrVal = 0;
       if(atr != INVALID_HANDLE)
       {
          double a[1];
-         if(CopyBuffer(atr, 0, s, 1, a) != 1 || a[0] <= 0) return false;
+         if(CopyBuffer(atr, 0, s, 1, a) != 1 || a[0] <= 0) return -1;
          atrVal = a[0];
          double ratio = (hi - lo) / atrVal;
-         if(InpMinRangeATR > 0 && ratio < InpMinRangeATR) return false;
-         if(InpMaxRangeATR > 0 && ratio > InpMaxRangeATR) return false;
+         if((InpMinRangeATR > 0 && ratio < InpMinRangeATR) || (InpMaxRangeATR > 0 && ratio > InpMaxRangeATR))
+         {
+            if(weekday) dg[D_RANGEFILT]++;
+            return 0;
+         }
       }
-      return true;
+      return 1;
    }
 
    // false = skip the day
@@ -429,7 +523,7 @@ private:
          if(!gapChecked)
          {
             gapChecked = true;
-            if(!CheckGap(iOpen(sym, InpBreakTF, sh))) { blocked = true; return; }
+            if(!CheckGap(iOpen(sym, InpBreakTF, sh))) { blocked = true; dg[D_GAP]++; return; }
          }
          if(InpBreakoutInWindow && bt + sec > winEnd) return;
          if(dir != 0 && !InpAllowFlip) return;
@@ -444,6 +538,7 @@ private:
          if((d > 0 && !InpTradeLong) || (d < 0 && !InpTradeShort)) continue;
 
          dir = d;
+         dg[D_BREAKOUT]++;
          breakFrom = bt + sec;         // retest must come after the breakout candle closed
          trig.active = false;
       }
@@ -580,25 +675,26 @@ private:
    bool Enter(double sl, string tag)
    {
       datetime now = TimeCurrent();
-      if(InpMaxTradesDayTotal > 0 && g_tradesDay >= InpMaxTradesDayTotal) return false;
-      if(InpMaxOpenTotal > 0 && g_openTotal >= InpMaxOpenTotal) return false;
+      dg[D_SETUP]++;
+      if((InpMaxTradesDayTotal > 0 && g_tradesDay >= InpMaxTradesDayTotal) ||
+         (InpMaxOpenTotal > 0 && g_openTotal >= InpMaxOpenTotal)) { dg[D_F_CAPS]++; return false; }
       if((InpNewsMode == NEWS_BLOCK || InpNewsMode == NEWS_BOTH) &&
-         NewsIn(now - InpNewsAfterMins * 60, now + InpNewsBeforeMins * 60)) return false;
+         NewsIn(now - InpNewsAfterMins * 60, now + InpNewsBeforeMins * 60)) { dg[D_F_NEWS]++; return false; }
 
       MqlTick tk;
-      if(!SymbolInfoTick(sym, tk)) return false;
+      if(!SymbolInfoTick(sym, tk)) { dg[D_F_SPREAD]++; return false; }
       double pt = SymbolInfoDouble(sym, SYMBOL_POINT);
       int    dg = (int)SymbolInfoInteger(sym, SYMBOL_DIGITS);
-      if(InpMaxSpreadPts > 0 && (tk.ask - tk.bid) / pt > InpMaxSpreadPts) return false;
+      if(InpMaxSpreadPts > 0 && (tk.ask - tk.bid) / pt > InpMaxSpreadPts) { dg[D_F_SPREAD]++; return false; }
 
       double price = (dir > 0) ? tk.ask : tk.bid;
       double risk  = (dir > 0) ? price - sl : sl - price;
       double minD  = MathMax(InpMinSL * unit, (SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) + 1) * pt);
       if(risk < minD) risk = minD;                                  // widen tiny stops
-      if(InpMaxSL > 0 && risk > InpMaxSL * unit) return false;
+      if(InpMaxSL > 0 && risk > InpMaxSL * unit) { dg[D_F_MAXSL]++; return false; }
 
       double lots = CalcLots(risk);
-      if(lots <= 0) return false;
+      if(lots <= 0) { dg[D_F_LOTS]++; return false; }
 
       sl = NormalizeDouble((dir > 0) ? price - risk : price + risk, dg);
       double tp = NormalizeDouble((dir > 0) ? price + risk * InpRR : price - risk * InpRR, dg);
@@ -609,9 +705,12 @@ private:
       if(ok && trade.ResultRetcode() == TRADE_RETCODE_DONE)
       {
          tradesToday++; g_tradesDay++; g_openTotal++; openPos++;
+         dg[D_ENTRY]++;
          return true;
       }
-      PrintFormat("%s entry failed (%s): %u %s", sym, tag, trade.ResultRetcode(), trade.ResultRetcodeDescription());
+      dg[D_F_TRADE]++;
+      lastRet = trade.ResultRetcode();
+      PrintFormat("%s entry failed (%s): %u %s", sym, tag, lastRet, trade.ResultRetcodeDescription());
       return false;
    }
 
@@ -711,8 +810,17 @@ int OnInit()
    if(MQLInfoInteger(MQL_TESTER) && (InpNewsMode != NEWS_OFF || InpNewsFlattenMins > 0)) LoadNewsFile();
    if(InpUseEarnings) LoadEarnings();
 
+   string syms = InpSymbols;
+   if(InpSymbolsFromFile)
+   {
+      int fh = FileOpen("BB_symbols.txt", FILE_READ | FILE_TXT | FILE_ANSI);
+      if(fh == INVALID_HANDLE) { Print("BB_symbols.txt not found (run BB_SymbolSelector)"); return INIT_FAILED; }
+      syms = "";
+      while(!FileIsEnding(fh)) syms += FileReadString(fh) + ",";
+      FileClose(fh);
+   }
    string list[];
-   int n = (Trim(InpSymbols) == "") ? 0 : StringSplit(InpSymbols, ',', list);
+   int n = (Trim(syms) == "") ? 0 : StringSplit(syms, ',', list);
    if(n == 0) { ArrayResize(list, 1); list[0] = _Symbol; n = 1; }
 
    for(int i = 0; i < n; i++)
@@ -735,7 +843,7 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    EventKillTimer();
-   WriteSymbolStats();
+   if(!MQLInfoInteger(MQL_OPTIMIZATION) && ArraySize(g_s) > 0) WriteStats();
    for(int i = ArraySize(g_s) - 1; i >= 0; i--) g_s[i].Release();
    ObjectsDeleteAll(0, "BB_");
 }
@@ -744,40 +852,112 @@ void OnTick()  { Pass(); }
 void OnTimer() { Pass(); }
 
 //+------------------------------------------------------------------+
-//| Per-symbol results -> journal + BB_symbol_stats.csv, to see      |
-//| which basket members carry the edge.                             |
+//| Per-symbol results + diagnostics (why a symbol did or didn't     |
+//| trade). Single test: BB_symbol_stats.csv; optimisation (incl.    |
+//| "All symbols selected in Market Watch"): one row per pass in     |
+//| BB_optim_diag.csv. Both in Terminal\Common\Files.                |
 //+------------------------------------------------------------------+
-void WriteSymbolStats()
+void PackStats(double &pk[])
 {
-   if(MQLInfoInteger(MQL_OPTIMIZATION) || !HistorySelect(0, TimeCurrent())) return;
    int n = ArraySize(g_s);
-   int    tr[], wn[];
-   double gp[], gl[];
-   ArrayResize(tr, n); ArrayResize(wn, n); ArrayResize(gp, n); ArrayResize(gl, n);
-   ArrayInitialize(tr, 0); ArrayInitialize(wn, 0); ArrayInitialize(gp, 0); ArrayInitialize(gl, 0);
-
+   ArrayResize(pk, n * PK_SIZE);
+   ArrayInitialize(pk, 0);
+   for(int i = 0; i < n; i++)
+   {
+      for(int k = 0; k < D_COUNT; k++) pk[i * PK_SIZE + PK_DIAG + k] = g_s[i].dg[k];
+      pk[i * PK_SIZE + PK_RET]  = g_s[i].lastRet;
+      pk[i * PK_SIZE + PK_MODE] = (double)g_s[i].tradeMode;
+   }
+   if(!HistorySelect(0, TimeCurrent())) return;
    for(int k = HistoryDealsTotal() - 1; k >= 0; k--)
    {
       ulong d = HistoryDealGetTicket(k);
       if(HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic) continue;
       int i = FindSym(HistoryDealGetString(d, DEAL_SYMBOL));
       if(i < 0) continue;
+      int b = i * PK_SIZE;
       double pl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP) +
                   HistoryDealGetDouble(d, DEAL_COMMISSION);
-      if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) { tr[i]++; if(pl > 0) wn[i]++; }
-      if(pl > 0) gp[i] += pl; else gl[i] -= pl;
+      if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) { pk[b + PK_TRADES]++; if(pl > 0) pk[b + PK_WINS]++; }
+      if(pl > 0) pk[b + PK_GP] += pl; else pk[b + PK_GL] -= pl;
    }
+   for(int i = 0; i < n; i++) pk[i * PK_SIZE + PK_NET] = pk[i * PK_SIZE + PK_GP] - pk[i * PK_SIZE + PK_GL];
+}
 
-   int h = FileOpen(STATS_FILE, FILE_WRITE | FILE_CSV | FILE_ANSI, ',');
-   if(h != INVALID_HANDLE) FileWrite(h, "symbol", "trades", "winrate", "net", "pf");
-   for(int i = 0; i < n; i++)
+string DiagHeader()
+{
+   string h = "pass,symbol,verdict,trade_mode,trades,winrate,net,pf";
+   for(int k = 0; k < D_COUNT; k++) h += "," + DG_NAMES[k];
+   return h + ",last_retcode";
+}
+
+// Main reason a symbol did (not) trade - for screening large symbol lists
+string Verdict(const double &p[], int b)
+{
+   double days = p[b + PK_DIAG + D_DAYS];
+   if(p[b + PK_TRADES] > 0)                                               return "traded";
+   if(days == 0)                                                          return "no_days";
+   if(p[b + PK_DIAG + D_NODATA] + p[b + PK_DIAG + D_STALE] >= 0.5 * days) return "NO_DATA";
+   if(p[b + PK_DIAG + D_F_TRADE] > 0)                                     return "TRADE_REJECTED";
+   if(p[b + PK_DIAG + D_F_LOTS] > 0)                                      return "LOT_TOO_BIG";
+   if(p[b + PK_DIAG + D_BREAKOUT] == 0)                                   return "no_breakouts";
+   if(p[b + PK_DIAG + D_SETUP] == 0)                                      return "no_setups";
+   return "filtered";
+}
+
+string DiagRow(long pass, string sym, const double &p[], int b)
+{
+   double tr = p[b + PK_TRADES];
+   string r = StringFormat("%s,%s,%s,%s,%d,%.1f,%.2f,%.2f", pass < 0 ? "" : IntegerToString(pass), sym,
+                           Verdict(p, b), TradeModeName((long)p[b + PK_MODE]), (int)tr,
+                           tr > 0 ? 100.0 * p[b + PK_WINS] / tr : 0.0, p[b + PK_NET],
+                           p[b + PK_GL] > 0 ? p[b + PK_GP] / p[b + PK_GL] : 0.0);
+   for(int k = 0; k < D_COUNT; k++) r += "," + IntegerToString((long)p[b + PK_DIAG + k]);
+   return r + "," + IntegerToString((long)p[b + PK_RET]);
+}
+
+void WriteStats()
+{
+   double pk[];
+   PackStats(pk);
+   int h = FileOpen(STATS_FILE, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   Print(DiagHeader());
+   if(h != INVALID_HANDLE) FileWriteString(h, DiagHeader() + "\r\n");
+   for(int i = 0; i < ArraySize(g_s); i++)
    {
-      double wr = tr[i] > 0 ? 100.0 * wn[i] / tr[i] : 0;
-      double pf = gl[i] > 0 ? gp[i] / gl[i] : 0;
-      PrintFormat("%-12s trades %4d  win %5.1f%%  net %10.2f  PF %5.2f", g_s[i].sym, tr[i], wr, gp[i] - gl[i], pf);
-      if(h != INVALID_HANDLE) FileWrite(h, g_s[i].sym, tr[i], DoubleToString(wr, 1), DoubleToString(gp[i] - gl[i], 2), DoubleToString(pf, 2));
+      string row = DiagRow(-1, g_s[i].sym, pk, i * PK_SIZE);
+      Print(row);
+      if(h != INVALID_HANDLE) FileWriteString(h, row + "\r\n");
    }
-   if(h != INVALID_HANDLE) FileClose(h);
+   if(h != INVALID_HANDLE) { FileClose(h); Print("Per-symbol stats: Terminal\\Common\\Files\\", STATS_FILE); }
+}
+
+//+------------------------------------------------------------------+
+//| Optimisation: each pass sends its per-symbol stats as frames,    |
+//| collected here on the terminal side into one CSV.                |
+//+------------------------------------------------------------------+
+int g_diagFile = INVALID_HANDLE;
+
+void OnTesterInit()
+{
+   g_diagFile = FileOpen(DIAG_FILE, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
+   if(g_diagFile != INVALID_HANDLE) FileWriteString(g_diagFile, DiagHeader() + "\r\n");
+}
+
+void OnTesterPass()
+{
+   ulong pass; string name; long id; double value; double data[];
+   while(FrameNext(pass, name, id, value, data))
+      if(g_diagFile != INVALID_HANDLE && ArraySize(data) == PK_SIZE)
+         FileWriteString(g_diagFile, DiagRow((long)pass, name, data, 0) + "\r\n");
+}
+
+void OnTesterDeinit()
+{
+   OnTesterPass();
+   if(g_diagFile == INVALID_HANDLE) return;
+   FileClose(g_diagFile);
+   Print("Optimisation diagnostics: Terminal\\Common\\Files\\", DIAG_FILE);
 }
 
 //+------------------------------------------------------------------+
@@ -785,6 +965,16 @@ void WriteSymbolStats()
 //+------------------------------------------------------------------+
 double OnTester()
 {
+   if(MQLInfoInteger(MQL_OPTIMIZATION))
+   {
+      double pk[], one[];
+      PackStats(pk);
+      for(int i = 0; i < ArraySize(g_s); i++)
+      {
+         ArrayCopy(one, pk, 0, i * PK_SIZE, PK_SIZE);
+         FrameAdd(g_s[i].sym, 1, pk[i * PK_SIZE + PK_TRADES], one);
+      }
+   }
    double trades = TesterStatistics(STAT_TRADES);
    double pf     = TesterStatistics(STAT_PROFIT_FACTOR);
    if(trades < InpMinTradesOpt || pf <= 0) return 0;

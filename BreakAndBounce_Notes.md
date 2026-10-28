@@ -135,3 +135,33 @@ It can take a while for ~1,500 candidates, because each one's history is downloa
 3. If a ticker still differs between machines, delete that machine's `Tester\Agent-*\bases\<server>\history\<symbol>` and `ticks\<symbol>` folders and re-run. They are rebuilt from the terminal's data.
 4. After a Market Watch optimisation, sort `BB_optim_diag.csv` by verdict. `NO_DATA` / `TRADE_REJECTED` rows are data or broker problems, not strategy results.
 5. Watch free disk space: each agent keeps its own copy of the tick history. Fewer agents means less disk.
+
+---
+
+# v2.2: strategy-improvement features and staged optimisation
+
+## New EA features (v2.20)
+| Input | What it does |
+|---|---|
+| `InpTrendMode` | `TREND_MA`: only breakouts in the direction of the symbol's daily close vs its `InpTrendMAPeriod`-day MA. `TREND_INDEX`: only breakouts in the direction the index (`InpTrendIndex`, e.g. US500) is trading vs its previous daily close, at the moment of the breakout. `TREND_BOTH`: both must agree. Breakouts against the trend are skipped (diagnostic `trend_skip`), and a later breakout the other way can still trade. The index symbol must be in Market Watch. |
+| `InpMaxHoldMins` | Closes a trade after x minutes. The video says trades normally last 1–2 h. |
+| `InpPartialR` / `InpPartialPct` | At x R, closes that % of the position and moves the stop to entry. If the lot is too small to split, it only moves the stop. |
+| Results per pattern/direction | The stats files now have `hammer_long / hammer_short / engulf_long / engulf_short` columns (trades, win %, net, PF), plus a **TOTAL** row for basket runs. `trades` now counts positions, so a partial close counts as one trade. |
+
+## The .set files (`sets/` folder)
+Copy them to `MQL5\Profiles\Tester\`. In the Strategy Tester's *Inputs* tab, right-click → **Load**. All of them use the basket from `BB_symbols.txt` (`InpSymbolsFromFile = true`). For the custom score (*Custom max* criterion), a result needs at least 300 trades.
+
+| File | Type | What to look at |
+|---|---|---|
+| `BB_Stage1a_Baseline.set` | Single test, Jan–Jun | TOTAL row and the four pattern/direction columns in `BB_symbol_stats.csv`. Which part is losing? |
+| `BB_Stage1b_RR1.set` | Single test, Jan–Jun, 1R target | Win rate well below 50% means the entry has no edge. Around 50% or more means work on exits |
+| `BB_Stage2_StopTarget.set` | Genetic, 3,600 combos | Stop mode/buffer/minimum, RR, breakeven, partial, time exit |
+| `BB_Stage3_Entry.set` | Genetic, ~124k combos | Hammer/engulfing entry modes, prior move, retest tolerance/penetration, breakout buffer, entry window, gap mode, **trend filter** |
+| `BB_Stage4_DayFilters.set` | Full search, 36 combos | Previous-range/ATR and gap/ATR filters |
+
+Procedure:
+1. Optimise on **Jan–Jun** with *1 minute OHLC*, genetic, *Custom max*.
+2. Look for an area of good results, not the single best pass. Pick values that are good across their neighbours.
+3. Re-run the top 3–5 sets on **Jul–Oct** with *Every tick based on real ticks*, **without changing anything**.
+4. Carry the winners forward. Stages 3 and 4 say at the top which values to set first.
+5. Success means PF ≥ 1.2 in-sample, ≥ 1.1 out-of-sample, on 300+ trades. At 2R the strategy needs a win rate above about 36% after costs.

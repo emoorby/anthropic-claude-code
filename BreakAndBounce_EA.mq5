@@ -11,7 +11,7 @@
 //|  share the same exchange session (run one basket per exchange).  |
 //+------------------------------------------------------------------+
 #property copyright "Break & Bounce EA"
-#property version   "2.10"
+#property version   "2.20"
 // Sent to tester agents (must exist in MQL5\Files; create with BB_ExportCalendar.mq5 / by hand)
 #property tester_file "BB_news.csv"
 #property tester_file "BB_earnings.csv"
@@ -43,6 +43,10 @@ enum ENUM_LOT_MODE    {LOT_FIXED=0,        // Fixed lots
 enum ENUM_GAP_MODE    {GAP_ALLOW=0,        // Allow (original rules)
                        GAP_SKIP=1,         // Skip day if open is outside range
                        GAP_REBREAK=2};     // Need a close back inside range, then a fresh break
+enum ENUM_TREND_MODE  {TREND_OFF=0,        // Off
+                       TREND_MA=1,         // Symbol's daily close vs its moving average
+                       TREND_INDEX=2,      // Index vs its previous close at the breakout
+                       TREND_BOTH=3};      // Both must agree
 enum ENUM_NEWS_MODE   {NEWS_OFF=0,         // Off
                        NEWS_BLOCK=1,       // No entries around events
                        NEWS_SKIP_DAY=2,    // Skip day if event pre-open .. window end
@@ -100,6 +104,11 @@ input group "=== Step 2: Breakout ==="
 input ENUM_TIMEFRAMES InpBreakTF           = PERIOD_M15;    // Breakout timeframe
 input bool            InpAllowFlip         = false;         // Opposite breakout replaces first one
 
+input group "=== Trend filter (breakouts only with the trend) ==="
+input ENUM_TREND_MODE InpTrendMode         = TREND_OFF;     // Trend filter
+input int             InpTrendMAPeriod     = 20;            // Daily MA period
+input string          InpTrendIndex        = "US500";       // Index symbol for TREND_INDEX
+
 input group "=== Step 3: Retest & candle ==="
 input ENUM_TIMEFRAMES InpSignalTF          = PERIOD_M5;     // Signal timeframe
 input bool            InpRequireCloseBeyond= true;          // Signal candle must close beyond level
@@ -128,6 +137,9 @@ input ENUM_SL_MODE    InpSLMode            = SL_CANDLE;     // Stop-loss placeme
 input double          InpSLRangeFactor     = 0.2;           // SL_PRT: candle range factor
 input double          InpRR                = 3.0;           // Target as multiple of risk
 input double          InpBreakevenR        = 0.0;           // Move SL to entry at x R (0=off)
+input double          InpPartialR          = 0.0;           // Close part of the trade at x R, SL to entry (0=off)
+input double          InpPartialPct        = 50;            // Partial: % of position closed
+input int             InpMaxHoldMins       = 0;             // Close trade after x minutes (0=off)
 input ENUM_LOT_MODE   InpLotMode           = LOT_RISK_PCT;  // Lot sizing
 input double          InpLots              = 0.1;           // Fixed lots
 input double          InpRiskPct           = 0.5;           // Risk % of equity per trade
@@ -140,11 +152,13 @@ struct Trigger {bool active; int dir; double price; double sl; datetime expiry;}
 
 // Diagnostic counters: why a symbol did or didn't trade
 enum ENUM_DIAG {D_DAYS, D_NODATA, D_STALE, D_RANGEFILT, D_GAP, D_NEWS, D_EARN, D_BREAKOUT,
-                D_SETUP, D_ENTRY, D_F_SPREAD, D_F_NEWS, D_F_LOTS, D_F_MAXSL, D_F_CAPS, D_F_TRADE};
-#define D_COUNT 16
+                D_SETUP, D_ENTRY, D_F_SPREAD, D_F_NEWS, D_F_LOTS, D_F_MAXSL, D_F_CAPS, D_F_TRADE, D_TREND};
+#define D_COUNT 17
 string DG_NAMES[] = {"days", "no_data", "stale_range", "range_filter", "gap_skip", "news_skip",
                             "earnings_skip", "breakouts", "setups", "entries", "f_spread", "f_news",
-                            "f_lots", "f_max_sl", "f_caps", "f_trade"};
+                            "f_lots", "f_max_sl", "f_caps", "f_trade", "trend_skip"};
+// Results per pattern & direction (bucket = engulf*2 + short)
+string BK_NAMES[] = {"hammer_long", "hammer_short", "engulf_long", "engulf_short"};
 // Packed stats layout (FrameAdd payload / CSV row)
 #define PK_TRADES 0
 #define PK_WINS   1
@@ -154,7 +168,8 @@ string DG_NAMES[] = {"days", "no_data", "stale_range", "range_filter", "gap_skip
 #define PK_DIAG   5
 #define PK_RET    (PK_DIAG + D_COUNT)
 #define PK_MODE   (PK_RET + 1)
-#define PK_SIZE   (PK_MODE + 1)
+#define PK_BK     (PK_MODE + 1)               // 4 buckets x {trades, wins, gp, gl}
+#define PK_SIZE   (PK_BK + 16)
 
 datetime g_news[];                    // sorted high-impact event times
 string   g_eTick[];                   // earnings file rows
@@ -291,6 +306,22 @@ void LoadEarnings()
    FileClose(h);
 }
 
+// +1 if the index is above its previous daily close at time t, -1 below, 0 unknown
+int IndexBias(datetime t)
+{
+   int sh = iBarShift(InpTrendIndex, PERIOD_M1, t, false);
+   if(sh < 0) return 0;
+   double px = iClose(InpTrendIndex, PERIOD_M1, sh);
+   datetime d = t - t % 86400;
+   int s = iBarShift(InpTrendIndex, PERIOD_D1, d - 1, false);
+   if(s < 0) return 0;
+   MqlDateTime dt;
+   TimeToStruct(iTime(InpTrendIndex, PERIOD_D1, s), dt);
+   if(InpSkipSundayBar && dt.day_of_week == 0) s++;
+   double pc = iClose(InpTrendIndex, PERIOD_D1, s);
+   return (px > pc) ? 1 : (px < pc) ? -1 : 0;
+}
+
 //+------------------------------------------------------------------+
 //| Per-symbol strategy state and logic                              |
 //+------------------------------------------------------------------+
@@ -303,7 +334,8 @@ public:
    datetime breakFrom, lastBrkBar, lastBrkDone, lastSigBar, engDoneBar;
    double   hi, lo, prevClose, atrVal, unit;
    int      dir, tradesToday, openPos;
-   bool     rangeOk, rangePending, weekday, blocked, gapChecked, needReset;
+   bool     rangeOk, rangePending, weekday, blocked, gapChecked, needReset, trendSkipped;
+   int      trendMA;                  // +1 / -1 / 0 from the daily MA
    datetime lastRangeTry;
    MqlRates p1;                       // last closed signal bar
    Trigger  trig;
@@ -389,7 +421,7 @@ private:
       day = d;
       dir = 0; tradesToday = 0;
       trig.active = false;
-      blocked = false; gapChecked = false; needReset = false;
+      blocked = false; gapChecked = false; needReset = false; trendSkipped = false;
       breakFrom = 0; lastBrkBar = 0; lastBrkDone = 0; engDoneBar = 0;
       sessStart = d + InpOpenHour * 3600 + InpOpenMin * 60;
       winEnd    = sessStart + InpEntryWindowMins * 60;
@@ -496,7 +528,25 @@ private:
             return 0;
          }
       }
+      trendMA = 0;
+      if(InpTrendMode == TREND_MA || InpTrendMode == TREND_BOTH)
+      {
+         double c[];
+         if(CopyClose(sym, PERIOD_D1, s, InpTrendMAPeriod, c) != InpTrendMAPeriod) return -1;
+         double ma = 0;
+         for(int i = 0; i < InpTrendMAPeriod; i++) ma += c[i];
+         ma /= InpTrendMAPeriod;
+         double last = c[InpTrendMAPeriod - 1];               // close of the range day
+         trendMA = (last > ma) ? 1 : (last < ma) ? -1 : 0;
+      }
       return 1;
+   }
+
+   bool TrendOk(int d, datetime t)
+   {
+      if((InpTrendMode == TREND_MA || InpTrendMode == TREND_BOTH) && trendMA != d) return false;
+      if((InpTrendMode == TREND_INDEX || InpTrendMode == TREND_BOTH) && IndexBias(t) != d) return false;
+      return true;
    }
 
    // false = skip the day
@@ -536,6 +586,11 @@ private:
          else if(c < lo - InpBreakBuffer * unit) d = -1;
          if(d == 0 || d == dir) continue;
          if((d > 0 && !InpTradeLong) || (d < 0 && !InpTradeShort)) continue;
+         if(InpTrendMode != TREND_OFF && !TrendOk(d, bt + sec - 1))
+         {
+            if(!trendSkipped) { trendSkipped = true; dg[D_TREND]++; }
+            continue;
+         }
 
          dir = d;
          dg[D_BREAKOUT]++;
@@ -762,22 +817,35 @@ void ManageAll(datetime now)
       int i = FindSym(sym);
       if(i < 0) continue;
 
-      if(newsSoon || now >= g_s[i].exitTime || (datetime)PositionGetInteger(POSITION_TIME) < g_s[i].day)
+      datetime opened = (datetime)PositionGetInteger(POSITION_TIME);
+      if(newsSoon || now >= g_s[i].exitTime || opened < g_s[i].day ||
+         (InpMaxHoldMins > 0 && now - opened >= InpMaxHoldMins * 60))
       {
          if(trade.PositionClose(tkt)) continue;
       }
       g_s[i].openPos++; g_openTotal++;
 
-      if(InpBreakevenR <= 0) continue;
+      if(InpBreakevenR <= 0 && InpPartialR <= 0) continue;
       double op = PositionGetDouble(POSITION_PRICE_OPEN);
       double sl = PositionGetDouble(POSITION_SL);
       double tp = PositionGetDouble(POSITION_TP);
       bool   buy = PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY;
       double risk = buy ? op - sl : sl - op;
       if(sl == 0 || risk <= 0) continue;                         // already at/after breakeven
-      double cur = buy ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK);
-      if((buy ? cur - op : op - cur) >= risk * InpBreakevenR)
-         trade.PositionModify(tkt, NormalizeDouble(op, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS)), tp);
+      double cur  = buy ? SymbolInfoDouble(sym, SYMBOL_BID) : SymbolInfoDouble(sym, SYMBOL_ASK);
+      double gain = buy ? cur - op : op - cur;
+      double beSL = NormalizeDouble(op, (int)SymbolInfoInteger(sym, SYMBOL_DIGITS));
+
+      if(InpPartialR > 0 && gain >= risk * InpPartialR)
+      {
+         double vol  = PositionGetDouble(POSITION_VOLUME);
+         double step = SymbolInfoDouble(sym, SYMBOL_VOLUME_STEP);
+         double part = MathFloor(vol * InpPartialPct / 100.0 / step) * step;
+         if(part >= SymbolInfoDouble(sym, SYMBOL_VOLUME_MIN) && part < vol) trade.PositionClosePartial(tkt, part);
+         trade.PositionModify(tkt, beSL, tp);
+      }
+      else if(InpBreakevenR > 0 && gain >= risk * InpBreakevenR)
+         trade.PositionModify(tkt, beSL, tp);
    }
 }
 
@@ -836,6 +904,12 @@ int OnInit()
    }
    if(ArraySize(g_s) == 0) return INIT_FAILED;
 
+   if((InpTrendMode == TREND_INDEX || InpTrendMode == TREND_BOTH) && !SymbolSelect(InpTrendIndex, true))
+   {
+      Print("Trend index symbol not available: ", InpTrendIndex);
+      return INIT_PARAMETERS_INCORRECT;
+   }
+
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(20);
    if(ArraySize(g_s) > 1) EventSetTimer(1);   // other symbols may tick when the chart symbol doesn't
@@ -859,10 +933,25 @@ void OnTimer() { Pass(); }
 //| "All symbols selected in Market Watch"): one row per pass in     |
 //| BB_optim_diag.csv. Both in Terminal\Common\Files.                |
 //+------------------------------------------------------------------+
+// Positions are aggregated from their deals (partial closes count once). Opening deal
+// comment gives the pattern, its type the direction. Block n (after the symbols) = TOTAL.
+int FindKey(const long &keys[], int n, long pid)
+{
+   int a = 0, b = n;
+   while(a < b) { int m = (a + b) >> 1; if(keys[m] < pid * 4) a = m + 1; else b = m; }
+   return (a < n && keys[a] / 4 == pid) ? a : -1;
+}
+
+void AddPos(double &pk[], int t, int w, int gp, int gl, double v)
+{
+   pk[t]++;
+   if(v > 0) { pk[w]++; pk[gp] += v; } else pk[gl] -= v;
+}
+
 void PackStats(double &pk[])
 {
    int n = ArraySize(g_s);
-   ArrayResize(pk, n * PK_SIZE);
+   ArrayResize(pk, (n + 1) * PK_SIZE);
    ArrayInitialize(pk, 0);
    for(int i = 0; i < n; i++)
    {
@@ -870,27 +959,65 @@ void PackStats(double &pk[])
       pk[i * PK_SIZE + PK_RET]  = g_s[i].lastRet;
       pk[i * PK_SIZE + PK_MODE] = (double)g_s[i].tradeMode;
    }
-   if(!HistorySelect(0, TimeCurrent())) return;
-   for(int k = HistoryDealsTotal() - 1; k >= 0; k--)
+
+   if(HistorySelect(0, TimeCurrent()))
    {
-      ulong d = HistoryDealGetTicket(k);
-      if(HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic) continue;
-      int i = FindSym(HistoryDealGetString(d, DEAL_SYMBOL));
-      if(i < 0) continue;
-      int b = i * PK_SIZE;
-      double pl = HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP) +
-                  HistoryDealGetDouble(d, DEAL_COMMISSION);
-      if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) { pk[b + PK_TRADES]++; if(pl > 0) pk[b + PK_WINS]++; }
-      if(pl > 0) pk[b + PK_GP] += pl; else pk[b + PK_GL] -= pl;
+      int nd = HistoryDealsTotal(), nk = 0;
+      long keys[];
+      ArrayResize(keys, nd);
+      for(int k = 0; k < nd; k++)
+      {
+         ulong d = HistoryDealGetTicket(k);
+         if(HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic || HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) continue;
+         int bk = (StringFind(HistoryDealGetString(d, DEAL_COMMENT), "engulf") >= 0 ? 2 : 0) +
+                  (HistoryDealGetInteger(d, DEAL_TYPE) == DEAL_TYPE_SELL ? 1 : 0);
+         keys[nk++] = HistoryDealGetInteger(d, DEAL_POSITION_ID) * 4 + bk;
+      }
+      ArrayResize(keys, nk);
+      ArraySort(keys);
+
+      double net[];
+      int    psym[];
+      int    closed[];
+      ArrayResize(net, nk); ArrayResize(psym, nk); ArrayResize(closed, nk);
+      ArrayInitialize(net, 0); ArrayInitialize(psym, -1); ArrayInitialize(closed, 0);
+      for(int k = 0; k < nd; k++)
+      {
+         ulong d = HistoryDealGetTicket(k);
+         if(HistoryDealGetInteger(d, DEAL_MAGIC) != (long)InpMagic) continue;
+         int j = FindKey(keys, nk, HistoryDealGetInteger(d, DEAL_POSITION_ID));
+         if(j < 0) continue;
+         net[j] += HistoryDealGetDouble(d, DEAL_PROFIT) + HistoryDealGetDouble(d, DEAL_SWAP) +
+                   HistoryDealGetDouble(d, DEAL_COMMISSION);
+         if(psym[j] < 0) psym[j] = FindSym(HistoryDealGetString(d, DEAL_SYMBOL));
+         if(HistoryDealGetInteger(d, DEAL_ENTRY) != DEAL_ENTRY_IN) closed[j] = 1;
+      }
+      for(int j = 0; j < nk; j++)
+      {
+         if(closed[j] == 0 || psym[j] < 0) continue;
+         int b = psym[j] * PK_SIZE, o = b + PK_BK + (int)(keys[j] % 4) * 4;
+         AddPos(pk, b + PK_TRADES, b + PK_WINS, b + PK_GP, b + PK_GL, net[j]);
+         AddPos(pk, o, o + 1, o + 2, o + 3, net[j]);
+      }
    }
-   for(int i = 0; i < n; i++) pk[i * PK_SIZE + PK_NET] = pk[i * PK_SIZE + PK_GP] - pk[i * PK_SIZE + PK_GL];
+
+   int t = n * PK_SIZE;                                 // TOTAL block
+   for(int i = 0; i < n; i++)
+   {
+      int b = i * PK_SIZE;
+      pk[b + PK_NET] = pk[b + PK_GP] - pk[b + PK_GL];
+      for(int k = 0; k < PK_SIZE; k++) if(k != PK_RET && k != PK_MODE) pk[t + k] += pk[b + k];
+   }
+   pk[t + PK_MODE] = (double)SYMBOL_TRADE_MODE_FULL;
 }
 
 string DiagHeader()
 {
    string h = "pass,symbol,verdict,trade_mode,trades,winrate,net,pf";
    for(int k = 0; k < D_COUNT; k++) h += "," + DG_NAMES[k];
-   return h + ",last_retcode";
+   h += ",last_retcode";
+   for(int q = 0; q < 4; q++) h += "," + BK_NAMES[q] + "_trades," + BK_NAMES[q] + "_win," + BK_NAMES[q] + "_net," + BK_NAMES[q] + "_pf";
+   return h;
 }
 
 // Main reason a symbol did (not) trade - for screening large symbol lists
@@ -915,19 +1042,28 @@ string DiagRow(long pass, string sym, const double &p[], int b)
                            tr > 0 ? 100.0 * p[b + PK_WINS] / tr : 0.0, p[b + PK_NET],
                            p[b + PK_GL] > 0 ? p[b + PK_GP] / p[b + PK_GL] : 0.0);
    for(int k = 0; k < D_COUNT; k++) r += "," + IntegerToString((long)p[b + PK_DIAG + k]);
-   return r + "," + IntegerToString((long)p[b + PK_RET]);
+   r += "," + IntegerToString((long)p[b + PK_RET]);
+   for(int q = 0; q < 4; q++)
+   {
+      int o = b + PK_BK + q * 4;
+      r += StringFormat(",%d,%.1f,%.2f,%.2f", (int)p[o], p[o] > 0 ? 100.0 * p[o + 1] / p[o] : 0.0,
+                        p[o + 2] - p[o + 3], p[o + 3] > 0 ? p[o + 2] / p[o + 3] : 0.0);
+   }
+   return r;
 }
 
 void WriteStats()
 {
    double pk[];
    PackStats(pk);
+   int n = ArraySize(g_s);
    int h = FileOpen(STATS_FILE, FILE_WRITE | FILE_TXT | FILE_ANSI | FILE_COMMON);
    Print(DiagHeader());
    if(h != INVALID_HANDLE) FileWriteString(h, DiagHeader() + "\r\n");
-   for(int i = 0; i < ArraySize(g_s); i++)
+   for(int i = 0; i <= n; i++)
    {
-      string row = DiagRow(-1, g_s[i].sym, pk, i * PK_SIZE);
+      if(i == n && n == 1) break;                       // TOTAL only for baskets
+      string row = DiagRow(-1, i < n ? g_s[i].sym : "TOTAL", pk, i * PK_SIZE);
       Print(row);
       if(h != INVALID_HANDLE) FileWriteString(h, row + "\r\n");
    }
@@ -971,10 +1107,12 @@ double OnTester()
    {
       double pk[], one[];
       PackStats(pk);
-      for(int i = 0; i < ArraySize(g_s); i++)
+      int n = ArraySize(g_s);
+      for(int i = 0; i <= n; i++)
       {
+         if(i == n && n == 1) break;
          ArrayCopy(one, pk, 0, i * PK_SIZE, PK_SIZE);
-         FrameAdd(g_s[i].sym, 1, pk[i * PK_SIZE + PK_TRADES], one);
+         FrameAdd(i < n ? g_s[i].sym : "TOTAL", 1, pk[i * PK_SIZE + PK_TRADES], one);
       }
    }
    double trades = TesterStatistics(STAT_TRADES);

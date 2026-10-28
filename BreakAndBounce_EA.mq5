@@ -689,7 +689,9 @@ private:
 
       double price = (dir > 0) ? tk.ask : tk.bid;
       double risk  = (dir > 0) ? price - sl : sl - price;
-      double minD  = MathMax(InpMinSL * unit, (SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) + 1) * pt);
+      // SL is checked against the opposite price, so the broker minimum must include the spread
+      double minD  = MathMax(InpMinSL * unit,
+                             (SymbolInfoInteger(sym, SYMBOL_TRADE_STOPS_LEVEL) + 1) * pt + (tk.ask - tk.bid));
       if(risk < minD) risk = minD;                                  // widen tiny stops
       if(InpMaxSL > 0 && risk > InpMaxSL * unit) { dg[D_F_MAXSL]++; return false; }
 

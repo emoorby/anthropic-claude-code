@@ -165,3 +165,10 @@ Procedure:
 3. Re-run the top 3–5 sets on **Jul–Oct** with *Every tick based on real ticks*, **without changing anything**.
 4. Carry the winners forward. Stages 3 and 4 say at the top which values to set first.
 5. Success means PF ≥ 1.2 in-sample, ≥ 1.1 out-of-sample, on 300+ trades. At 2R the strategy needs a win rate above about 36% after costs.
+
+## v2.3: R-multiples and fixed-risk sizing
+* **`InpRiskBase`**: `RISK_EQUITY` sizes from current equity (compounds; use for live). `RISK_START_BALANCE` risks the same $ amount on every trade (use for tests, so a drawdown doesn't shrink later trades). All `.set` files now use the starting balance.
+* **R-multiples.** Each trade's money at risk is recorded at entry, and every result is also reported as profit ÷ initial risk.
+  * New columns `sum_R` and `exp_R` (expectancy = average R per trade), plus `<pattern>_expR` for each of the four buckets.
+  * R doesn't depend on deposit, lot rounding or broker lot caps.
+  * `exp_R > 0` after costs is the real test of the edge. Roughly, +0.10R per trade on 300+ trades is worth pursuing.

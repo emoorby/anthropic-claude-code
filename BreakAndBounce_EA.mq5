@@ -11,7 +11,7 @@
 //|  share the same exchange session (run one basket per exchange).  |
 //+------------------------------------------------------------------+
 #property copyright "Break & Bounce EA"
-#property version   "2.20"
+#property version   "2.30"
 // Sent to tester agents (must exist in MQL5\Files; create with BB_ExportCalendar.mq5 / by hand)
 #property tester_file "BB_news.csv"
 #property tester_file "BB_earnings.csv"
@@ -38,6 +38,8 @@ enum ENUM_HAM_ENTRY   {HAM_AT_CLOSE=0,     // Market at hammer close (live demo 
 enum ENUM_ENG_MODE    {ENG_INTRABAR=0,     // Enter as price takes prev candle high/low (video)
                        ENG_ON_CLOSE=1,     // Wait for close; high/low range engulf
                        ENG_PRT_STRICT=2};  // Wait for close; body beyond prev range (PRT)
+enum ENUM_RISK_BASE   {RISK_EQUITY=0,      // Current equity (compounds)
+                       RISK_START_BALANCE=1}; // Starting balance (same $ risk every trade)
 enum ENUM_LOT_MODE    {LOT_FIXED=0,        // Fixed lots
                        LOT_RISK_PCT=1};    // % of equity at risk
 enum ENUM_GAP_MODE    {GAP_ALLOW=0,        // Allow (original rules)
@@ -142,7 +144,8 @@ input double          InpPartialPct        = 50;            // Partial: % of pos
 input int             InpMaxHoldMins       = 0;             // Close trade after x minutes (0=off)
 input ENUM_LOT_MODE   InpLotMode           = LOT_RISK_PCT;  // Lot sizing
 input double          InpLots              = 0.1;           // Fixed lots
-input double          InpRiskPct           = 0.5;           // Risk % of equity per trade
+input double          InpRiskPct           = 0.5;           // Risk % per trade
+input ENUM_RISK_BASE  InpRiskBase          = RISK_EQUITY;   // Risk % of (use starting balance for tests)
 
 input group "=== Optimisation ==="
 input int             InpMinTradesOpt      = 30;            // OnTester: min trades for a score
@@ -168,14 +171,19 @@ string BK_NAMES[] = {"hammer_long", "hammer_short", "engulf_long", "engulf_short
 #define PK_DIAG   5
 #define PK_RET    (PK_DIAG + D_COUNT)
 #define PK_MODE   (PK_RET + 1)
-#define PK_BK     (PK_MODE + 1)               // 4 buckets x {trades, wins, gp, gl}
-#define PK_SIZE   (PK_BK + 16)
+#define PK_SUMR   (PK_MODE + 1)               // sum of R-multiples
+#define PK_BK     (PK_SUMR + 1)               // 4 buckets x {trades, wins, gp, gl, sumR}
+#define PK_BKW    5
+#define PK_SIZE   (PK_BK + 4 * PK_BKW)
 
 datetime g_news[];                    // sorted high-impact event times
 string   g_eTick[];                   // earnings file rows
 datetime g_eDate[];
 int      g_eTiming[];                 // 0 unknown, 1 before open, 2 after close
 datetime g_day = 0, g_lastPass = 0;
+double   g_startBalance = 0;
+long     g_rPid[];                    // position id -> money at risk at entry (for R-multiples)
+double   g_rRisk[];
 int      g_tradesDay = 0, g_openTotal = 0;
 
 //+------------------------------------------------------------------+
@@ -225,6 +233,21 @@ string TradeModeName(long m)
       case SYMBOL_TRADE_MODE_FULL:      return "full";
    }
    return "unknown";
+}
+
+// Position ids are opening-order tickets, so they arrive in ascending order
+void RecordRisk(long pid, double money)
+{
+   int n = ArraySize(g_rPid);
+   ArrayResize(g_rPid, n + 1, 1024); ArrayResize(g_rRisk, n + 1, 1024);
+   g_rPid[n] = pid; g_rRisk[n] = money;
+}
+
+double RiskOf(long pid)
+{
+   int a = 0, b = ArraySize(g_rPid);
+   while(a < b) { int m = (a + b) >> 1; if(g_rPid[m] < pid) a = m + 1; else b = m; }
+   return (a < ArraySize(g_rPid) && g_rPid[a] == pid) ? g_rRisk[a] : 0;
 }
 
 // Input files: the agent's own MQL5\Files (filled via #property tester_file), else
@@ -773,6 +796,8 @@ private:
       if(ok && trade.ResultRetcode() == TRADE_RETCODE_DONE)
       {
          tradesToday++; g_tradesDay++; g_openTotal++; openPos++;
+         double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE_LOSS), ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+         if(ts > 0) RecordRisk((long)trade.ResultOrder(), risk / ts * tv * lots);
          dg[D_ENTRY]++;
          return true;
       }
@@ -794,7 +819,8 @@ private:
          double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE_LOSS);
          double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
          if(tv <= 0 || ts <= 0) return 0;
-         lots = AccountInfoDouble(ACCOUNT_EQUITY) * InpRiskPct / 100.0 / (risk / ts * tv);
+         double base = (InpRiskBase == RISK_START_BALANCE) ? g_startBalance : AccountInfoDouble(ACCOUNT_EQUITY);
+         lots = base * InpRiskPct / 100.0 / (risk / ts * tv);
       }
       lots = MathFloor(lots / step) * step;
       if(lots < vMin) return 0;                    // can't trade within risk budget
@@ -921,6 +947,9 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
    }
 
+   g_startBalance = AccountInfoDouble(ACCOUNT_BALANCE);
+   ArrayResize(g_rPid, 0); ArrayResize(g_rRisk, 0);
+
    trade.SetExpertMagicNumber(InpMagic);
    trade.SetDeviationInPoints(20);
    if(ArraySize(g_s) > 1) EventSetTimer(1);   // other symbols may tick when the chart symbol doesn't
@@ -1006,9 +1035,12 @@ void PackStats(double &pk[])
       for(int j = 0; j < nk; j++)
       {
          if(closed[j] == 0 || psym[j] < 0) continue;
-         int b = psym[j] * PK_SIZE, o = b + PK_BK + (int)(keys[j] % 4) * 4;
+         int b = psym[j] * PK_SIZE, o = b + PK_BK + (int)(keys[j] % 4) * PK_BKW;
+         double rk = RiskOf(keys[j] / 4), r = (rk > 0) ? net[j] / rk : 0;
          AddPos(pk, b + PK_TRADES, b + PK_WINS, b + PK_GP, b + PK_GL, net[j]);
          AddPos(pk, o, o + 1, o + 2, o + 3, net[j]);
+         pk[b + PK_SUMR] += r;
+         pk[o + 4]       += r;
       }
    }
 
@@ -1024,10 +1056,11 @@ void PackStats(double &pk[])
 
 string DiagHeader()
 {
-   string h = "pass,symbol,verdict,trade_mode,trades,winrate,net,pf";
+   string h = "pass,symbol,verdict,trade_mode,trades,winrate,net,pf,sum_R,exp_R";
    for(int k = 0; k < D_COUNT; k++) h += "," + DG_NAMES[k];
    h += ",last_retcode";
-   for(int q = 0; q < 4; q++) h += "," + BK_NAMES[q] + "_trades," + BK_NAMES[q] + "_win," + BK_NAMES[q] + "_net," + BK_NAMES[q] + "_pf";
+   for(int q = 0; q < 4; q++)
+      h += "," + BK_NAMES[q] + "_trades," + BK_NAMES[q] + "_win," + BK_NAMES[q] + "_net," + BK_NAMES[q] + "_pf," + BK_NAMES[q] + "_expR";
    return h;
 }
 
@@ -1052,13 +1085,15 @@ string DiagRow(long pass, string sym, const double &p[], int b)
                            Verdict(p, b), TradeModeName((long)p[b + PK_MODE]), (int)tr,
                            tr > 0 ? 100.0 * p[b + PK_WINS] / tr : 0.0, p[b + PK_NET],
                            p[b + PK_GL] > 0 ? p[b + PK_GP] / p[b + PK_GL] : 0.0);
+   r += StringFormat(",%.2f,%.3f", p[b + PK_SUMR], tr > 0 ? p[b + PK_SUMR] / tr : 0.0);
    for(int k = 0; k < D_COUNT; k++) r += "," + IntegerToString((long)p[b + PK_DIAG + k]);
    r += "," + IntegerToString((long)p[b + PK_RET]);
    for(int q = 0; q < 4; q++)
    {
-      int o = b + PK_BK + q * 4;
-      r += StringFormat(",%d,%.1f,%.2f,%.2f", (int)p[o], p[o] > 0 ? 100.0 * p[o + 1] / p[o] : 0.0,
-                        p[o + 2] - p[o + 3], p[o + 3] > 0 ? p[o + 2] / p[o + 3] : 0.0);
+      int o = b + PK_BK + q * PK_BKW;
+      r += StringFormat(",%d,%.1f,%.2f,%.2f,%.3f", (int)p[o], p[o] > 0 ? 100.0 * p[o + 1] / p[o] : 0.0,
+                        p[o + 2] - p[o + 3], p[o + 3] > 0 ? p[o + 2] / p[o + 3] : 0.0,
+                        p[o] > 0 ? p[o + 4] / p[o] : 0.0);
    }
    return r;
 }

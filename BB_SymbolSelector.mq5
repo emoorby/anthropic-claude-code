@@ -227,8 +227,11 @@ void OnStart()
    }
    if(h != INVALID_HANDLE) FileClose(h);
 
-   h = FileOpen("BB_symbols.txt", FILE_WRITE | FILE_TXT | FILE_ANSI);
-   if(h != INVALID_HANDLE) { FileWriteString(h, list); FileClose(h); }
+   for(int c = 0; c < 2; c++)                    // MQL5\Files and Common\Files (read by tester agents)
+   {
+      h = FileOpen("BB_symbols.txt", FILE_WRITE | FILE_TXT | FILE_ANSI | (c == 1 ? FILE_COMMON : 0));
+      if(h != INVALID_HANDLE) { FileWriteString(h, list); FileClose(h); }
+   }
 
    //--- 5. Market Watch: hide everything that didn't pass, show what did
    if(InpApply)

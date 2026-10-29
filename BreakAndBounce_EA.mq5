@@ -227,6 +227,17 @@ string TradeModeName(long m)
    return "unknown";
 }
 
+// Input files: the agent's own MQL5\Files (filled via #property tester_file), else
+// Terminal\Common\Files - local tester agents can always read the Common folder.
+int OpenInputFile(string name, int flags)
+{
+   int h = FileOpen(name, flags, ',');
+   if(h == INVALID_HANDLE) h = FileOpen(name, flags | FILE_COMMON, ',');
+   if(h == INVALID_HANDLE)
+      PrintFormat("%s not found in %s\\MQL5\\Files nor in Common\\Files", name, TerminalInfoString(TERMINAL_DATA_PATH));
+   return h;
+}
+
 // true if any news event lies in [from, to] (binary search)
 bool NewsIn(datetime from, datetime to)
 {
@@ -247,7 +258,7 @@ bool CurrencyWanted(string c)
 void LoadNewsFile()
 {
    ArrayResize(g_news, 0);
-   int h = FileOpen(NEWS_FILE, FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   int h = OpenInputFile(NEWS_FILE, FILE_READ | FILE_CSV | FILE_ANSI);
    if(h == INVALID_HANDLE) { Print("News file not found: ", NEWS_FILE, " - news filter inactive"); return; }
    string f[];
    while(!FileIsEnding(h))
@@ -288,7 +299,7 @@ void RefreshLiveNews(datetime day)
 // BB_earnings.csv (ticker,date[,BMO|AMC])
 void LoadEarnings()
 {
-   int h = FileOpen(EARN_FILE, FILE_READ | FILE_CSV | FILE_ANSI, ',');
+   int h = OpenInputFile(EARN_FILE, FILE_READ | FILE_CSV | FILE_ANSI);
    if(h == INVALID_HANDLE) { Print("Earnings file not found: ", EARN_FILE); return; }
    string f[];
    while(!FileIsEnding(h))
@@ -883,8 +894,8 @@ int OnInit()
    string syms = InpSymbols;
    if(InpSymbolsFromFile)
    {
-      int fh = FileOpen("BB_symbols.txt", FILE_READ | FILE_TXT | FILE_ANSI);
-      if(fh == INVALID_HANDLE) { Print("BB_symbols.txt not found (run BB_SymbolSelector)"); return INIT_FAILED; }
+      int fh = OpenInputFile("BB_symbols.txt", FILE_READ | FILE_TXT | FILE_ANSI);
+      if(fh == INVALID_HANDLE) return INIT_FAILED;
       syms = "";
       while(!FileIsEnding(fh)) syms += FileReadString(fh) + ",";
       FileClose(fh);

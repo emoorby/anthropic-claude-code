@@ -172,3 +172,15 @@ Procedure:
   * New columns `sum_R` and `exp_R` (expectancy = average R per trade), plus `<pattern>_expR` for each of the four buckets.
   * R doesn't depend on deposit, lot rounding or broker lot caps.
   * `exp_R > 0` after costs is the real test of the edge. Roughly, +0.10R per trade on 300+ trades is worth pursuing.
+
+## Findings to date (Jan–Oct 2026, 54 large-cap US stock CFDs, IC Markets)
+| Test | Result |
+|---|---|
+| 1R target, normal / wide stop | 43.7% / 47.7% wins: a coin flip or worse |
+| Stage 2 (141 exit combinations) | Best −0.03R; only the minimum-stop width mattered (costs), nothing positive |
+| Stage 2b (stops 45–85%) | Flat at about −0.03R |
+| In-sample shorts (Jan–Jun) | +0.08R |
+| **Out-of-sample Jul–Oct** | **−0.18R overall; shorts −0.25R, longs −0.14R** |
+
+Conclusion: the rules as specified show no edge. The full Stage 3 and Stage 4 optimisations were stopped to avoid fitting noise. Two final fixed tests remain:
+`BB_Final_TrendFilter_JanOct.set` and `BB_Final_Indices_2023.set`. If neither reaches +0.10R across the whole period, drop the strategy in this form.

@@ -88,6 +88,8 @@ input group "=== Shared calculations ==="
 input ENUM_ADR_MODE InpADRMode   = ADR_SMA_OF_ATR;
 input int           InpADRDays   = 15;   // Days in average daily range
 input int           InpATRPeriod = 14;   // ATR period (ADR_SMA_OF_ATR mode)
+input bool          InpADRUseSession = false; // Build daily bars from a session (not broker D1)
+input int           InpADRSessionStartCT = 0; // Session start (HHMM CT); session ends 16:00 CT
 input int           InpADXPeriod = 14;   // ADX period (Wilder)
 
 input group "=== S1 Vault Break (M30, long) ==="
@@ -469,7 +471,49 @@ void VWAdd(VWAPAcc &a, const MqlRates &b)
   }
 
 //+------------------------------------------------------------------+
-//| Average daily range (from broker D1 bars, completed days only)   |
+//| Session daily bars: H/L/C of M30 bars from the session start to  |
+//| the end of each server day (16:00 CT), completed days only       |
+//+------------------------------------------------------------------+
+int BuildSessionDays(datetime today, double &dh[], double &dl[], double &dc[])
+  {
+   MqlRates r[];
+   ArraySetAsSeries(r, false);
+   int n = CopyRates(_Symbol, PERIOD_M30, today - 80 * 86400, today - 1, r);
+   if(n <= 0)
+      return 0;
+   int sMin = SrvMin(InpADRSessionStartCT);
+   int cnt = 0;
+   datetime cur = 0;
+   ArrayResize(dh, 0);
+   ArrayResize(dl, 0);
+   ArrayResize(dc, 0);
+   for(int i = 0; i < n; i++)
+     {
+      if(MinOfDay(r[i].time) < sMin)
+         continue;
+      datetime day = DayStart(r[i].time);
+      if(day != cur)
+        {
+         cur = day;
+         cnt++;
+         ArrayResize(dh, cnt);
+         ArrayResize(dl, cnt);
+         ArrayResize(dc, cnt);
+         dh[cnt - 1] = r[i].high;
+         dl[cnt - 1] = r[i].low;
+        }
+      else
+        {
+         dh[cnt - 1] = MathMax(dh[cnt - 1], r[i].high);
+         dl[cnt - 1] = MathMin(dl[cnt - 1], r[i].low);
+        }
+      dc[cnt - 1] = r[i].close;
+     }
+   return cnt;
+  }
+
+//+------------------------------------------------------------------+
+//| Average daily range (completed days only)                        |
 //+------------------------------------------------------------------+
 double GetADR(datetime anyTimeToday)
   {
@@ -478,19 +522,38 @@ double GetADR(datetime anyTimeToday)
       return g_adrVal;
 
    int need = (InpADRMode == ADR_SMA_OF_ATR) ? InpADRDays + InpATRPeriod + 1 : InpADRDays + 1;
-   MqlRates r[];
-   ArraySetAsSeries(r, false);
-   int n = CopyRates(_Symbol, PERIOD_D1, d - 1, need, r);   // ends with yesterday's bar
+   double dh[], dl[], dc[];
+   int n = 0;
+   if(InpADRUseSession)
+      n = BuildSessionDays(d, dh, dl, dc);
+   else
+     {
+      MqlRates r[];
+      ArraySetAsSeries(r, false);
+      n = CopyRates(_Symbol, PERIOD_D1, d - 1, need, r);   // ends with yesterday's bar
+      if(n > 0)
+        {
+         ArrayResize(dh, n);
+         ArrayResize(dl, n);
+         ArrayResize(dc, n);
+         for(int i = 0; i < n; i++)
+           {
+            dh[i] = r[i].high;
+            dl[i] = r[i].low;
+            dc[i] = r[i].close;
+           }
+        }
+     }
    if(n < need)
       return 0;
 
    double tr[];
    ArrayResize(tr, n);
-   tr[0] = r[0].high - r[0].low;
+   tr[0] = dh[0] - dl[0];
    for(int i = 1; i < n; i++)
      {
-      double pc = r[i - 1].close;
-      tr[i] = MathMax(r[i].high, pc) - MathMin(r[i].low, pc);
+      double pc = dc[i - 1];
+      tr[i] = MathMax(dh[i], pc) - MathMin(dl[i], pc);
      }
 
    double adr = 0;

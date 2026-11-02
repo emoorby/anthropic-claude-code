@@ -39,6 +39,7 @@ Inputs for every research run:
 | S1_1030 | S1 | `InpS1_WindowStartCT = 1030` |
 | S1_TR | S1 | `InpADRMode = ADR_SMA_OF_TR` |
 | S1_2300 | S1 | `InpS1_AnchorCT = 2300` |
+| S1_sess | S1 | `InpADRUseSession = true` (daily range from 00:00–16:00 CT only) |
 | S2_base | S2 | none |
 | S2_vw0 | S2 | `InpS2_VWAPAnchorCT = 0` |
 | S2_1555 | S2 | `InpS2_ExitCT = 1555` |
@@ -47,6 +48,9 @@ Inputs for every research run:
 | S3_base | S3 | none |
 | S3_2300 | S3 | `InpS3_ONStartCT = 2300` |
 | S3_1430 | S3 | `InpS3_CutoffCT = 1430` |
+| S3_sess | S3 | `InpADRUseSession = true` |
+| S2_pretouch | S2 | `InpS2_TPMode = S2TP_PRETOUCH` |
+| S2_swing | S2 | `InpS2_TPMode = S2TP_SWING` |
 | S4_base | S4 | none |
 | S4_consec | S4 | `InpS4_LossRule = S4LOSS_CONSECUTIVE` |
 | ALL | all four | none |

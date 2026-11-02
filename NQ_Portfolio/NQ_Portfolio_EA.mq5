@@ -46,8 +46,10 @@ enum ENUM_ADR_MODE
 
 enum ENUM_S2_TP_MODE
   {
-   S2TP_FIXED  = 0, // TP fixed at entry (default)
-   S2TP_RECALC = 1  // TP recalculated every bar
+   S2TP_FIXED    = 0, // TP = N-bar high at signal, fixed (default)
+   S2TP_RECALC   = 1, // TP recalculated every bar
+   S2TP_PRETOUCH = 2, // TP = N-bar high ending at the VWAP-touch bar
+   S2TP_SWING    = 3  // TP = highest high from arming to the touch
   };
 
 enum ENUM_S4_LOSS_RULE
@@ -200,6 +202,8 @@ struct S2State
    double   orL;
    bool     armed;
    bool     touched;
+   double   swingHigh;   // highest high from arming up to the touch
+   datetime touchTime;   // bar time of the VWAP touch
    VWAPAcc  vw;
   };
 
@@ -1059,6 +1063,8 @@ void S2_OnBar(const MqlRates &b, bool latest)
       g_s2.orL = 0;
       g_s2.armed = false;
       g_s2.touched = false;
+      g_s2.swingHigh = 0;
+      g_s2.touchTime = 0;
       VWReset(g_s2.vw);
      }
    int om  = MinOfDay(b.time);
@@ -1091,9 +1097,12 @@ void S2_OnBar(const MqlRates &b, bool latest)
       if(latest)
          Log(K_S2, StringFormat("ARMED: close %.2f > OR high %.2f", b.close, g_s2.orH));
      }
+   if(g_s2.armed && !g_s2.touched)
+      g_s2.swingHigh = MathMax(g_s2.swingHigh, b.high);
    if(g_s2.armed && !g_s2.touched && b.low <= vwap)
      {
       g_s2.touched = true;
+      g_s2.touchTime = b.time;
       if(latest)
          Log(K_S2, StringFormat("TOUCH: low %.2f <= VWAP %.2f", b.low, vwap));
      }
@@ -1129,6 +1138,20 @@ void S2_OnBar(const MqlRates &b, bool latest)
    for(int i = need - InpS2_SLBars; i < need; i++)
       ll = MathMin(ll, r[i].low);
 
+   if(InpS2_TPMode == S2TP_PRETOUCH)
+     {
+      MqlRates t[];
+      ArraySetAsSeries(t, false);
+      if(CopyRates(_Symbol, PERIOD_M1, g_s2.touchTime, InpS2_TPBars, t) != InpS2_TPBars)
+         return;
+      hh = -DBL_MAX;
+      for(int i = 0; i < InpS2_TPBars; i++)
+         hh = MathMax(hh, t[i].high);
+     }
+   else
+      if(InpS2_TPMode == S2TP_SWING)
+         hh = g_s2.swingHigh;
+
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    if(hh - ask < InpS2_MinTPPts)
      {
@@ -1138,7 +1161,10 @@ void S2_OnBar(const MqlRates &b, bool latest)
    Log(K_S2, StringFormat("SIGNAL close %.2f > VWAP %.2f, ADX %.1f <= prev %.1f; TP %.2f SL %.2f",
                           b.close, vwap, adx, adxPrev, hh, ll));
    if(OpenTrade(K_S2, true, true, ll, hh, InpS2_RiskPct, InpS2_FixedLots, InpS2_MaxSpreadPts))
+     {
       g_s2.touched = false;   // a further trade (if allowed) needs a fresh VWAP touch
+      g_s2.swingHigh = 0;
+     }
   }
 
 // Mode B: recalculate TP to the highest high of the last N bars every bar

@@ -15,6 +15,7 @@ Usage
   python monte_carlo.py NQPortfolio_trades.csv
   python monte_carlo.py a.csv b.csv --strategies S1,S3,S4 --risk 0.1,0.2,0.3
   python monte_carlo.py trades.csv --weights S3=1.5,S4=0.5 --floor 5 --target 7
+  python monte_carlo.py trades.csv --cost 1.0     # deduct 1 extra point per trade
 
 Notes
   * Risk is % of current balance per trade, as the EA does in RISK_PCT mode.
@@ -31,13 +32,14 @@ import pandas as pd
 TIME_FMT = "%Y.%m.%d %H:%M:%S"
 
 
-def load_trades(paths):
+def load_trades(paths, cost_pts=0.0):
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
     df.columns = [c.strip() for c in df.columns]
     df["open_time"] = pd.to_datetime(df["open_time"], format=TIME_FMT)
     df["close_time"] = pd.to_datetime(df["close_time"], format=TIME_FMT)
     df["day"] = df["close_time"].dt.normalize()
     df = df[df["risk_points"] > 0].copy()
+    df["points"] = df["points"] - cost_pts      # extra cost stress (slippage etc.)
     df["R"] = df["points"] / df["risk_points"]
     return df.sort_values("close_time").reset_index(drop=True)
 
@@ -186,12 +188,14 @@ def main():
     ap.add_argument("--max-days", type=int, default=250, help="trading days per simulated challenge")
     ap.add_argument("--block", type=int, default=5, help="block length (days) for the bootstrap")
     ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--cost", type=float, default=0.0,
+                    help="extra cost in index points deducted from every trade (stress test)")
     a = ap.parse_args()
 
     rng = np.random.default_rng(a.seed)
     strategies = [s.strip() for s in a.strategies.split(",") if s.strip()]
     weights = parse_weights(a.weights)
-    df = load_trades(a.csv)
+    df = load_trades(a.csv, a.cost)
     df = df[df["strategy"].isin(strategies)]
     if df.empty:
         raise SystemExit("No trades for the selected strategies.")

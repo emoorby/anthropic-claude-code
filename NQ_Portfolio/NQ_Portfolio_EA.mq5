@@ -1,24 +1,51 @@
 //+------------------------------------------------------------------+
 //|                                              NQ_Portfolio_EA.mq5 |
-//|  Four intraday Nasdaq-100 strategies for USTEC (MT5, hedging):   |
+//|  Intraday index/gold strategies (MT5, hedging), one chart per    |
+//|  market, market presets for USTEC/US500/US30/DE40/XAUUSD/JP225:  |
 //|    S1 Vault Break            (M30, long)                         |
 //|    S2 VWAP Pullback + ADX    (M1,  long)                         |
 //|    S3 Overnight Bias ORB     (M15, long/short)                   |
 //|    S4 Drift VWAP Pullback    (M15 trend + M5 trigger, long/short)|
 //|  Built from EA_Strategy_Spec_v1.md (v1.1)                         |
 //|                                                                  |
-//|  All rule times are entered in US Central Time (HHMM) and are    |
-//|  converted to broker server time with InpServerMinusCT.          |
+//|  Rule times are local exchange times (HHMM); they are converted   |
+//|  to broker server time with the DST rules of the market's zone.  |
 //+------------------------------------------------------------------+
 #property copyright "Built from user-approved spec v1.1"
-#property version   "1.10"
-#property description "USTEC intraday portfolio: 4 strategies, prop floor/target guard, CSV trade log"
+#property version   "1.20"
+#property description "Multi-market intraday portfolio: market presets, account-wide prop floor/target guard, CSV trade log"
 
 #include <Trade\Trade.mqh>
 
 //+------------------------------------------------------------------+
 //| Enums                                                            |
 //+------------------------------------------------------------------+
+enum ENUM_MARKET
+  {
+   MKT_NAS100_CUSTOM = 0, // USTEC / custom: use the time inputs below as entered
+   MKT_US500         = 1, // US500 preset (US Central)
+   MKT_US30          = 2, // US30 preset (US Central)
+   MKT_DE40          = 3, // DE40 preset (Frankfurt time)
+   MKT_XAUUSD_NY     = 4, // XAUUSD preset, New York anchor (US Central)
+   MKT_XAUUSD_LDN    = 5, // XAUUSD preset, London anchor (London time)
+   MKT_JP225         = 6  // JP225 preset (Tokyo time) - experimental
+  };
+
+enum ENUM_TZ
+  {
+   TZ_US_CENTRAL = 0, // US Central (Chicago)
+   TZ_US_EASTERN = 1, // US Eastern (New York)
+   TZ_EUROPE_CET = 2, // Central Europe (Frankfurt)
+   TZ_LONDON     = 3, // London
+   TZ_TOKYO      = 4  // Tokyo (no DST)
+  };
+
+enum ENUM_BROKER_DST
+  {
+   BROKER_DST_US = 0, // GMT+2/+3 switching on US dates (IC Markets)
+   BROKER_DST_EU = 1  // GMT+2/+3 switching on EU dates
+  };
+
 enum ENUM_PROFILE
   {
    PROFILE_PROP     = 0, // PROP: static floor + profit target, halts
@@ -62,7 +89,12 @@ enum ENUM_S4_LOSS_RULE
 //| Inputs                                                           |
 //+------------------------------------------------------------------+
 input group "=== General ==="
-input int          InpServerMinusCT   = 8;      // Server time minus US Central (hours)
+input ENUM_MARKET     InpMarket          = MKT_NAS100_CUSTOM; // Market preset (sets session times and cost scaling)
+input ENUM_TZ         InpCustomTZ        = TZ_US_CENTRAL;     // Time zone of the time inputs (USTEC / custom only)
+input ENUM_BROKER_DST InpBrokerDST       = BROKER_DST_US;     // Broker server clock
+input int             InpMagicOffset     = -1;     // Magic number offset (-1 = automatic per market)
+input double          InpMaxSpreadADRPct = 1.2;    // Presets: max spread to enter, % of daily range
+input double          InpMinSizingADRPct = 3.0;    // Presets: size as if SL were at least this % of daily range
 input bool         InpSkipHolidays    = true;   // Skip US holidays + early-close days
 input bool         InpVerbose         = true;   // Print signals / skips to journal
 input string       InpFilePrefix      = "NQPortfolio"; // CSV file prefix (Common\Files)
@@ -90,7 +122,7 @@ input ENUM_ADR_MODE InpADRMode   = ADR_SMA_OF_ATR; // Daily range (ADR) formula
 input int           InpADRDays   = 15;   // Days in average daily range
 input int           InpATRPeriod = 14;   // ATR period (ADR_SMA_OF_ATR mode)
 input bool          InpADRUseSession = false; // Build daily bars from a session (not broker D1)
-input int           InpADRSessionStartCT = 0; // Session start (HHMM CT); session ends 16:00 CT
+input int           InpADRSessionStartCT = 0; // Session start (HHMM local); session ends 16:00 CT
 input int           InpADXPeriod = 14;   // ADX period (Wilder)
 
 input group "=== S1 Vault Break (M30, long) ==="
@@ -98,11 +130,11 @@ input bool   InpS1_Enable        = true; // S1: Enable strategy
 input long   InpS1_Magic         = 26001; // S1: Magic number (must be unique)
 input double InpS1_RiskPct       = 0.25; // S1: Risk % per trade (risk-% sizing)
 input double InpS1_FixedLots     = 0.1; // S1: Lots per trade (fixed-lots sizing)
-input int    InpS1_AnchorCT      = 0;     // S1: Session open + VWAP anchor (HHMM CT; 2300 = prev evening)
+input int    InpS1_AnchorCT      = 0;     // S1: Session open + VWAP anchor (HHMM local; presets override)
 input double InpS1_NoiseFrac     = 0.30;  // S1: Noise level = open + frac x ADR
-input int    InpS1_WindowStartCT = 1000;  // S1: Signal-bar close from (HHMM CT)  [test 1030]
-input int    InpS1_WindowEndCT   = 1430;  // S1: Signal-bar close before (HHMM CT)
-input int    InpS1_ExitCT        = 1430;  // S1: Time exit (HHMM CT)
+input int    InpS1_WindowStartCT = 1000;  // S1: Signal-bar close from (HHMM local; presets override)  [test 1030]
+input int    InpS1_WindowEndCT   = 1430;  // S1: Signal-bar close before (HHMM local; presets override)
+input int    InpS1_ExitCT        = 1430;  // S1: Time exit (HHMM local; presets override)
 input int    InpS1_MaxEntries    = 3;     // S1: Max entries per day
 input int    InpS1_MaxLosses     = 1;     // S1: Stop for the day after this many losses (0 = off)
 input double InpS1_TPPts         = 40;    // S1: Take profit (index points)
@@ -116,12 +148,12 @@ input bool            InpS2_Enable       = false; // S2: Enable strategy
 input long            InpS2_Magic        = 26002; // S2: Magic number (must be unique)
 input double          InpS2_RiskPct      = 0.25; // S2: Risk % per trade (risk-% sizing)
 input double          InpS2_FixedLots    = 0.1; // S2: Lots per trade (fixed-lots sizing)
-input int             InpS2_ORStartCT    = 830;   // S2: Opening range start (HHMM CT)
-input int             InpS2_OREndCT      = 900;   // S2: Opening range end (HHMM CT)
-input int             InpS2_VWAPAnchorCT = 830;   // S2: VWAP anchor (HHMM CT) [test 0]
+input int             InpS2_ORStartCT    = 830;   // S2: Opening range start (HHMM local)
+input int             InpS2_OREndCT      = 900;   // S2: Opening range end (HHMM local)
+input int             InpS2_VWAPAnchorCT = 830;   // S2: VWAP anchor (HHMM local) [test 0]
 input double          InpS2_ADXMin       = 20; // S2: Minimum ADX
-input int             InpS2_CutoffCT     = 1430;  // S2: No new entries from (HHMM CT)
-input int             InpS2_ExitCT       = 1455;  // S2: Time exit (HHMM CT) [test 1555]
+input int             InpS2_CutoffCT     = 1430;  // S2: No new entries from (HHMM local)
+input int             InpS2_ExitCT       = 1455;  // S2: Time exit (HHMM local) [test 1555]
 input int             InpS2_MaxTrades    = 1;     // S2: Max trades per day [test 2]
 input int             InpS2_TPBars       = 5;     // S2: TP = highest high of N bars
 input int             InpS2_SLBars       = 20;    // S2: SL = lowest low of N bars
@@ -134,11 +166,11 @@ input bool   InpS3_Enable       = true; // S3: Enable strategy
 input long   InpS3_Magic        = 26003; // S3: Magic number (must be unique)
 input double InpS3_RiskPct      = 0.50; // S3: Risk % per trade (risk-% sizing)
 input double InpS3_FixedLots    = 0.1; // S3: Lots per trade (fixed-lots sizing)
-input int    InpS3_ONStartCT    = 0;     // S3: Overnight range start (HHMM CT) [test 2300]
-input int    InpS3_OpenCT       = 830;   // S3: Cash open / bias bar (HHMM CT)
+input int    InpS3_ONStartCT    = 0;     // S3: Overnight range start (HHMM local; presets override) [test 2300]
+input int    InpS3_OpenCT       = 830;   // S3: Cash open / bias bar (HHMM local; presets override)
 input double InpS3_ADXMin       = 20; // S3: Minimum ADX
-input int    InpS3_CutoffCT     = 1400;  // S3: No new entries from (HHMM CT) [test 1430]
-input int    InpS3_ExitCT       = 1430;  // S3: Time exit (HHMM CT)
+input int    InpS3_CutoffCT     = 1400;  // S3: No new entries from (HHMM local; presets override) [test 1430]
+input int    InpS3_ExitCT       = 1430;  // S3: Time exit (HHMM local; presets override)
 input double InpS3_SLFrac       = 0.40;  // S3: SL = frac x ADR
 input double InpS3_TPMult       = 3.0;   // S3: TP = mult x SL
 input bool   InpS3_AllowLong    = true; // S3: Allow long trades
@@ -150,10 +182,10 @@ input bool              InpS4_Enable       = false; // S4: Enable strategy
 input long              InpS4_Magic        = 26004; // S4: Magic number (must be unique)
 input double            InpS4_RiskPct      = 0.25; // S4: Risk % per trade (risk-% sizing)
 input double            InpS4_FixedLots    = 0.1; // S4: Lots per trade (fixed-lots sizing)
-input int               InpS4_VWAPAnchorCT = 830;   // S4: VWAP anchor on M15 (HHMM CT)
-input int               InpS4_TradeStartCT = 930;   // S4: First signal-bar close (HHMM CT)
-input int               InpS4_CutoffCT     = 1430;  // S4: No new entries from (HHMM CT)
-input int               InpS4_ExitCT       = 1455;  // S4: Close all (HHMM CT)
+input int               InpS4_VWAPAnchorCT = 830;   // S4: VWAP anchor on M15 (HHMM local)
+input int               InpS4_TradeStartCT = 930;   // S4: First signal-bar close (HHMM local)
+input int               InpS4_CutoffCT     = 1430;  // S4: No new entries from (HHMM local)
+input int               InpS4_ExitCT       = 1455;  // S4: Close all (HHMM local)
 input double            InpS4_MinMovePct   = 0.10;  // S4: Min 1-hour move (%)
 input int               InpS4_LookbackBars = 4;     // S4: M15 bars for the move (4 = 1 hour)
 input double            InpS4_LongTPPts    = 40; // S4: Long take profit (index points)
@@ -252,6 +284,17 @@ S4State    g_s4;
 int      g_hADX_M1  = INVALID_HANDLE;
 int      g_hADX_M15 = INVALID_HANDLE;
 
+// effective (preset-adjusted) settings
+ENUM_TZ  g_tz = TZ_US_CENTRAL;
+string   g_mktName = "USTEC/custom";
+int      g_s1Anchor, g_s1Start, g_s1End, g_s1Exit;
+int      g_s3ON, g_s3Open, g_s3Cut, g_s3Exit;
+bool     g_s1Scale = false;
+bool     g_relCosts = false;
+bool     g_s2On = false, g_s4On = false;
+long     g_magicOff = 0;
+int      g_shiftMin = 480;   // server minus local exchange time, minutes
+
 double   g_initBal = 0;
 double   g_hwm     = 0;      // LIVE: highest equity seen (trailing drawdown)
 bool     g_halted  = false;
@@ -273,10 +316,10 @@ bool     g_blkVal = false;
 int MinOfDay(datetime t)      { return (int)(((long)t % 86400) / 60); }
 datetime DayStart(datetime t) { return (datetime)((long)t - ((long)t % 86400)); }
 
-// HHMM in US Central -> minute of the server day
-int SrvMin(int hhmmCT)
+// HHMM local exchange time -> minute of the server day (uses today's DST shift)
+int SrvMin(int hhmm)
   {
-   int m = (hhmmCT / 100) * 60 + (hhmmCT % 100) + InpServerMinusCT * 60;
+   int m = (hhmm / 100) * 60 + (hhmm % 100) + g_shiftMin;
    m %= 1440;
    if(m < 0)
       m += 1440;
@@ -346,6 +389,67 @@ datetime EasterSunday(int y)
    return MkDate(y, mon, dd);
   }
 
+// Daylight saving (date resolution; clocks change at weekends)
+bool IsUSDST(datetime t)
+  {
+   MqlDateTime s;
+   TimeToStruct(t, s);
+   datetime d = DayStart(t);
+   return (d >= NthWeekday(s.year, 3, 0, 2) && d < NthWeekday(s.year, 11, 0, 1));
+  }
+
+bool IsEUDST(datetime t)
+  {
+   MqlDateTime s;
+   TimeToStruct(t, s);
+   datetime d = DayStart(t);
+   return (d >= LastWeekday(s.year, 3, 0) && d < LastWeekday(s.year, 10, 0));
+  }
+
+int ServerUTCOffset(datetime t)
+  {
+   bool dst = (InpBrokerDST == BROKER_DST_US) ? IsUSDST(t) : IsEUDST(t);
+   return 2 + (dst ? 1 : 0);
+  }
+
+int LocalUTCOffset(ENUM_TZ tz, datetime t)
+  {
+   switch(tz)
+     {
+      case TZ_US_CENTRAL:
+         return -6 + (IsUSDST(t) ? 1 : 0);
+      case TZ_US_EASTERN:
+         return -5 + (IsUSDST(t) ? 1 : 0);
+      case TZ_EUROPE_CET:
+         return 1 + (IsEUDST(t) ? 1 : 0);
+      case TZ_LONDON:
+         return 0 + (IsEUDST(t) ? 1 : 0);
+      case TZ_TOKYO:
+         return 9;
+     }
+   return -6;
+  }
+
+int ShiftMinAt(datetime t) { return (ServerUTCOffset(t) - LocalUTCOffset(g_tz, t)) * 60; }
+
+string TZName(ENUM_TZ tz)
+  {
+   switch(tz)
+     {
+      case TZ_US_CENTRAL:
+         return "US Central";
+      case TZ_US_EASTERN:
+         return "US Eastern";
+      case TZ_EUROPE_CET:
+         return "Frankfurt";
+      case TZ_LONDON:
+         return "London";
+      case TZ_TOKYO:
+         return "Tokyo";
+     }
+   return "?";
+  }
+
 // US (NYSE) full holidays and early-close days
 bool IsUSHolidayOrEarlyClose(datetime t)
   {
@@ -391,8 +495,8 @@ bool IsUSHolidayOrEarlyClose(datetime t)
 
 bool DayBlocked(datetime d)
   {
-   if(!InpSkipHolidays)
-      return false;
+   if(!InpSkipHolidays || (g_tz != TZ_US_CENTRAL && g_tz != TZ_US_EASTERN))
+      return false;   // calendar covers US exchanges only
    datetime ds = DayStart(d);
    if(ds != g_blkDay)
      {
@@ -662,17 +766,21 @@ void CloseAllOurs(string why)
   }
 
 // Money at risk to stop on all open positions in this symbol
+// Account-wide: every open position on every symbol (several charts share one floor)
 double OpenRiskAmount()
   {
-   double vpp = ValuePerPointPerLot();
    double sum = 0;
    for(int i = PositionsTotal() - 1; i >= 0; i--)
      {
       ulong t = PositionGetTicket(i);
       if(t == 0)
          continue;
-      if(PositionGetString(POSITION_SYMBOL) != _Symbol)
-         continue;
+      string sym = PositionGetString(POSITION_SYMBOL);
+      double tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE_LOSS);
+      if(tv <= 0)
+         tv = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_VALUE);
+      double ts = SymbolInfoDouble(sym, SYMBOL_TRADE_TICK_SIZE);
+      double vpp = (ts > 0) ? tv / ts : 0;
       double sl  = PositionGetDouble(POSITION_SL);
       double cur = PositionGetDouble(POSITION_PRICE_CURRENT);
       double vol = PositionGetDouble(POSITION_VOLUME);
@@ -813,6 +921,11 @@ void CheckGuards()
   {
    if(InpProfile == PROFILE_RESEARCH)
       return;
+   if(!g_halted && GlobalVariableCheck(g_gv + "halt"))
+     {
+      g_halted = true;   // another chart of this account halted
+      Print("*** EA HALTED: halt flag set by another chart on this account ***");
+     }
    if(g_halted)
      {
       CloseAllOurs("halted");
@@ -858,7 +971,14 @@ double CalcLots(double riskPts, double riskPct, double fixedLots, string &why)
    double vpp = ValuePerPointPerLot();
    // size as if the stop were at least InpMinSizingPts away (stops a very tight
    // S2 stop from producing an oversized position)
-   double perLot = MathMax(riskPts, InpMinSizingPts) * vpp;
+   double minDist = InpMinSizingPts;
+   if(g_relCosts)
+     {
+      double adr = GetADR(TimeCurrent());
+      if(adr > 0)
+         minDist = adr * InpMinSizingADRPct / 100.0;
+     }
+   double perLot = MathMax(riskPts, minDist) * vpp;
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    double lots;
 
@@ -896,6 +1016,15 @@ double CalcLots(double riskPts, double riskPct, double fixedLots, string &why)
    return NormalizeDouble(lots, digits);
   }
 
+// Presets: max spread as a % of the daily range; USTEC/custom: the strategy's input
+double EffSpread(double inputPts)
+  {
+   if(!g_relCosts)
+      return inputPts;
+   double adr = GetADR(TimeCurrent());
+   return (adr > 0) ? adr * InpMaxSpreadADRPct / 100.0 : inputPts;
+  }
+
 //+------------------------------------------------------------------+
 //| Order entry                                                      |
 //|  absolute=true : slArg/tpArg are price levels                    |
@@ -911,6 +1040,7 @@ bool OpenTrade(int k, bool isLong, bool absolute, double slArg, double tpArg,
    if(ask <= 0 || bid <= 0)
       return false;
    double spread = ask - bid;
+   maxSpread = EffSpread(maxSpread);
    if(maxSpread > 0 && spread > maxSpread)
      {
       Log(k, StringFormat("SKIP: spread %.2f > max %.2f", spread, maxSpread));
@@ -1090,7 +1220,7 @@ void S1_OnBar(const MqlRates &b, bool latest)
    int om = MinOfDay(b.time);
    if(!g_s1.haveOpen)
      {
-      if(om < SrvMin(InpS1_AnchorCT))
+      if(om < SrvMin(g_s1Anchor))
          return;
       g_s1.haveOpen = true;
       g_s1.sessOpen = b.open;
@@ -1101,7 +1231,7 @@ void S1_OnBar(const MqlRates &b, bool latest)
       return;
 
    int cm = om + PeriodSeconds(PERIOD_M30) / 60;
-   if(cm < SrvMin(InpS1_WindowStartCT) || cm >= SrvMin(InpS1_WindowEndCT))
+   if(cm < SrvMin(g_s1Start) || cm >= SrvMin(g_s1End))
       return;
    if(DayBlocked(d))
       return;
@@ -1123,7 +1253,7 @@ void S1_OnBar(const MqlRates &b, bool latest)
       return;
 
    double tpPts = InpS1_TPPts, slPts = InpS1_SLPts;
-   if(InpS1_ScaleWithADR && InpS1_RefADR > 0)
+   if(g_s1Scale && InpS1_RefADR > 0)
      {
       double f = adr / InpS1_RefADR;
       tpPts *= f;
@@ -1300,7 +1430,7 @@ void S3_OnBar(const MqlRates &b, bool latest)
       g_s3.bias = 0;
      }
    int om  = MinOfDay(b.time);
-   int onS = SrvMin(InpS3_ONStartCT), op = SrvMin(InpS3_OpenCT);
+   int onS = SrvMin(g_s3ON), op = SrvMin(g_s3Open);
 
    if(om >= onS && om < op)
      {
@@ -1346,7 +1476,7 @@ void S3_OnBar(const MqlRates &b, bool latest)
       return;
 
    int cm = om + PeriodSeconds(PERIOD_M15) / 60;
-   if(cm >= SrvMin(InpS3_CutoffCT))
+   if(cm >= SrvMin(g_s3Cut))
       return;
    if(DayBlocked(d))
       return;
@@ -1537,7 +1667,7 @@ void WriteTradeLog()
       Print("Cannot open ", fn, " err=", GetLastError());
       return;
      }
-   FileWrite(fh, "strategy", "direction", "open_time", "close_time", "open_time_ct", "volume",
+   FileWrite(fh, "strategy", "symbol", "direction", "open_time", "close_time", "open_time_local", "volume",
              "entry_price", "exit_price", "points", "risk_points", "r_multiple", "profit", "exit_reason");
    int rows = 0;
    for(int i = 0; i < total; i++)
@@ -1573,10 +1703,10 @@ void WriteTradeLog()
                   HistoryDealGetDouble(t, DEAL_COMMISSION) + HistoryDealGetDouble(it, DEAL_COMMISSION);
       datetime ot = (datetime)HistoryDealGetInteger(it, DEAL_TIME);
       datetime ct = (datetime)HistoryDealGetInteger(t, DEAL_TIME);
-      FileWrite(fh, tag, isLong ? "long" : "short",
+      FileWrite(fh, tag, _Symbol, isLong ? "long" : "short",
                 TimeToString(ot, TIME_DATE | TIME_SECONDS),
                 TimeToString(ct, TIME_DATE | TIME_SECONDS),
-                TimeToString(ot - InpServerMinusCT * 3600, TIME_DATE | TIME_SECONDS),
+                TimeToString(ot - ShiftMinAt(ot) * 60, TIME_DATE | TIME_SECONDS),
                 DoubleToString(HistoryDealGetDouble(t, DEAL_VOLUME), 2),
                 DoubleToString(ep, _Digits), DoubleToString(xp, _Digits),
                 DoubleToString(pts, 2), DoubleToString(risk, 2), DoubleToString(rm, 4),
@@ -1619,6 +1749,81 @@ void InitStrat(int k, string name, long magic)
       g_st[k].trackedPosId = PositionGetInteger(POSITION_IDENTIFIER);
   }
 
+void SetS1(int a, int st, int en, int ex)  { g_s1Anchor = a; g_s1Start = st; g_s1End = en; g_s1Exit = ex; }
+void SetS3(int on, int op, int cut, int ex) { g_s3ON = on; g_s3Open = op; g_s3Cut = cut; g_s3Exit = ex; }
+
+// Market presets: local exchange times. Non-USTEC presets scale S1 exits,
+// the spread filter and the minimum sizing distance by the daily range.
+void ApplyPreset()
+  {
+   g_tz = InpCustomTZ;
+   SetS1(InpS1_AnchorCT, InpS1_WindowStartCT, InpS1_WindowEndCT, InpS1_ExitCT);
+   SetS3(InpS3_ONStartCT, InpS3_OpenCT, InpS3_CutoffCT, InpS3_ExitCT);
+   g_s1Scale = InpS1_ScaleWithADR;
+   g_relCosts = false;
+   long autoOff = 0;
+   switch(InpMarket)
+     {
+      case MKT_US500:
+         g_mktName = "US500";
+         g_tz = TZ_US_CENTRAL;
+         SetS1(0, 1000, 1430, 1430);
+         SetS3(0, 830, 1400, 1430);
+         autoOff = 100;
+         break;
+      case MKT_US30:
+         g_mktName = "US30";
+         g_tz = TZ_US_CENTRAL;
+         SetS1(0, 1000, 1430, 1430);
+         SetS3(0, 830, 1400, 1430);
+         autoOff = 200;
+         break;
+      case MKT_DE40:
+         g_mktName = "DE40";
+         g_tz = TZ_EUROPE_CET;
+         SetS1(0, 1030, 1700, 1700);
+         SetS3(0, 900, 1630, 1700);
+         autoOff = 300;
+         break;
+      case MKT_XAUUSD_NY:
+         g_mktName = "XAUUSD (New York)";
+         g_tz = TZ_US_CENTRAL;
+         SetS1(0, 900, 1230, 1230);
+         SetS3(0, 730, 1200, 1230);
+         autoOff = 400;
+         break;
+      case MKT_XAUUSD_LDN:
+         g_mktName = "XAUUSD (London)";
+         g_tz = TZ_LONDON;
+         SetS1(0, 930, 1630, 1630);
+         SetS3(0, 800, 1600, 1630);
+         autoOff = 500;
+         break;
+      case MKT_JP225:
+         g_mktName = "JP225";
+         g_tz = TZ_TOKYO;
+         SetS1(700, 1030, 1500, 1500);
+         SetS3(700, 900, 1430, 1500);
+         autoOff = 600;
+         break;
+      default:
+         g_mktName = "USTEC/custom";
+         break;
+     }
+   if(InpMarket != MKT_NAS100_CUSTOM)
+     {
+      g_s1Scale = true;     // S1 exits as fractions of the daily range (40/75 pts at ADR 324)
+      g_relCosts = true;
+     }
+   g_magicOff = (InpMagicOffset >= 0) ? InpMagicOffset : autoOff;
+   // S2 and S4 have no edge on USTEC and no presets: USTEC/custom only
+   g_s2On = InpS2_Enable && InpMarket == MKT_NAS100_CUSTOM;
+   g_s4On = InpS4_Enable && InpMarket == MKT_NAS100_CUSTOM;
+   if((InpS2_Enable || InpS4_Enable) && InpMarket != MKT_NAS100_CUSTOM)
+      Print("Note: S2/S4 are only available with the USTEC/custom market setting and are ignored here.");
+   g_shiftMin = ShiftMinAt(TimeCurrent());
+  }
+
 bool CheckTime(int v, string name)
   {
    if(ValidHHMM(v))
@@ -1632,11 +1837,6 @@ bool CheckSameDay(int v, string name)
   {
    if(!CheckTime(v, name))
       return false;
-   if(v >= 1600)
-     {
-      Print(name, " must be before 16:00 CT (server day boundary)");
-      return false;
-     }
    return true;
   }
 
@@ -1662,16 +1862,17 @@ int OnInit()
       return INIT_PARAMETERS_INCORRECT;
      }
 
-   InitStrat(K_S1, "S1", InpS1_Magic);
-   InitStrat(K_S2, "S2", InpS2_Magic);
-   InitStrat(K_S3, "S3", InpS3_Magic);
-   InitStrat(K_S4, "S4", InpS4_Magic);
+   ApplyPreset();
+   InitStrat(K_S1, "S1", InpS1_Magic + g_magicOff);
+   InitStrat(K_S2, "S2", InpS2_Magic + g_magicOff);
+   InitStrat(K_S3, "S3", InpS3_Magic + g_magicOff);
+   InitStrat(K_S4, "S4", InpS4_Magic + g_magicOff);
    g_s1.day = 0;
    g_s2.day = 0;
    g_s3.day = 0;
    g_s4.day = 0;
 
-   if(InpS2_Enable)
+   if(g_s2On)
      {
       g_hADX_M1 = iADXWilder(_Symbol, PERIOD_M1, InpADXPeriod);
       if(g_hADX_M1 == INVALID_HANDLE)
@@ -1724,9 +1925,9 @@ int OnInit()
 
    PrintFormat("NQ Portfolio EA on %s | profile %s | initial balance %.2f | floor %.2f | target %.2f | equity high %.2f | halted=%s",
                _Symbol, EnumToString(InpProfile), g_initBal, FloorLevel(), TargetLevel(), g_hwm, g_halted ? "YES" : "no");
-   PrintFormat("Time map (server = CT + %d h): 00:00 CT=%02d:%02d, 08:30 CT=%02d:%02d, 14:30 CT=%02d:%02d",
-               InpServerMinusCT, SrvMin(0) / 60, SrvMin(0) % 60, SrvMin(830) / 60, SrvMin(830) % 60,
-               SrvMin(1430) / 60, SrvMin(1430) % 60);
+   PrintFormat("Market %s | times in %s | server = local %+d min | S3 open %04d local = %02d:%02d server, S3 exit %04d = %02d:%02d | magic offset %d",
+               g_mktName, TZName(g_tz), g_shiftMin, g_s3Open, SrvMin(g_s3Open) / 60, SrvMin(g_s3Open) % 60,
+               g_s3Exit, SrvMin(g_s3Exit) / 60, SrvMin(g_s3Exit) % 60, (int)g_magicOff);
    PrintFormat("Symbol: value per point per lot %.4f %s, min lot %.2f, step %.2f, stops level %.2f",
                ValuePerPointPerLot(), AccountInfoString(ACCOUNT_CURRENCY),
                SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN), SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP),
@@ -1750,6 +1951,7 @@ void OnDeinit(const int reason)
 void OnTick()
   {
    datetime now = TimeCurrent();
+   g_shiftMin = ShiftMinAt(now);
 
    for(int k = 0; k < NSTRAT; k++)
       CheckClosed(k);
@@ -1759,12 +1961,12 @@ void OnTick()
       return;
 
    if(InpS1_Enable)
-      TimeExit(K_S1, InpS1_ExitCT, now);
-   if(InpS2_Enable)
+      TimeExit(K_S1, g_s1Exit, now);
+   if(g_s2On)
       TimeExit(K_S2, InpS2_ExitCT, now);
    if(InpS3_Enable)
-      TimeExit(K_S3, InpS3_ExitCT, now);
-   if(InpS4_Enable)
+      TimeExit(K_S3, g_s3Exit, now);
+   if(g_s4On)
       TimeExit(K_S4, InpS4_ExitCT, now);
 
    MqlRates r[];
@@ -1777,7 +1979,7 @@ void OnTick()
          S1_OnBar(r[i], i == n - 1 && IsFresh(r[i], PERIOD_M30));
      }
 
-   if(InpS2_Enable)
+   if(g_s2On)
      {
       n = GetNewBars(PERIOD_M1, g_cur1, r);
       for(int i = 0; i < n; i++)
@@ -1793,7 +1995,7 @@ void OnTick()
          S3_OnBar(r[i], i == n - 1 && IsFresh(r[i], PERIOD_M15));
      }
 
-   if(InpS4_Enable)
+   if(g_s4On)
      {
       // M15 trend first, so an M5 bar closing at the same moment sees the fresh state
       n = GetNewBars(PERIOD_M15, g_cur15s4, r);

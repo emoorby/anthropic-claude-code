@@ -32,14 +32,21 @@ import pandas as pd
 TIME_FMT = "%Y.%m.%d %H:%M:%S"
 
 
-def load_trades(paths, cost_pts=0.0):
+def load_trades(paths, cost_pts=0.0, cost_risk_pct=0.0):
     df = pd.concat([pd.read_csv(p) for p in paths], ignore_index=True)
     df.columns = [c.strip() for c in df.columns]
     df["open_time"] = pd.to_datetime(df["open_time"], format=TIME_FMT)
     df["close_time"] = pd.to_datetime(df["close_time"], format=TIME_FMT)
     df["day"] = df["close_time"].dt.normalize()
     df = df[df["risk_points"] > 0].copy()
-    df["points"] = df["points"] - cost_pts      # extra cost stress (slippage etc.)
+    if "symbol" in df.columns:
+        df["symbol"] = df["symbol"].fillna("USTEC")   # logs from v1.10 and earlier had no symbol column
+    if "symbol" in df.columns and df["symbol"].nunique() > 1:
+        # several markets: name each stream strategy@symbol, e.g. S3@DE40
+        df["strategy"] = df["strategy"] + "@" + df["symbol"].astype(str)
+    # cost stress: fixed points (single market) and/or % of each trade's stop
+    # distance (comparable across markets; 1 pt on a USTEC S3 stop is ~0.8%)
+    df["points"] = df["points"] - cost_pts - df["risk_points"] * cost_risk_pct / 100.0
     df["R"] = df["points"] / df["risk_points"]
     return df.sort_values("close_time").reset_index(drop=True)
 
@@ -177,7 +184,7 @@ def parse_weights(text):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("csv", nargs="+", help="trade log CSV file(s) exported by the EA")
-    ap.add_argument("--strategies", default="S1,S2,S3,S4")
+    ap.add_argument("--strategies", default="", help="comma list, e.g. S1,S3 or S3@DE40 (default: all in the files)")
     ap.add_argument("--risk", default="0.1,0.15,0.2,0.25,0.3,0.4,0.5,0.75,1.0",
                     help="risk %% per trade levels to test")
     ap.add_argument("--weights", default="", help="per-strategy multipliers, e.g. S3=1.5,S4=0.5")
@@ -190,12 +197,14 @@ def main():
     ap.add_argument("--seed", type=int, default=42)
     ap.add_argument("--cost", type=float, default=0.0,
                     help="extra cost in index points deducted from every trade (stress test)")
+    ap.add_argument("--cost-risk-pct", type=float, default=0.0,
+                    help="extra cost as %% of each trade's stop distance (use for multi-market files, e.g. 1.0)")
     a = ap.parse_args()
 
     rng = np.random.default_rng(a.seed)
-    strategies = [s.strip() for s in a.strategies.split(",") if s.strip()]
     weights = parse_weights(a.weights)
-    df = load_trades(a.csv, a.cost)
+    df = load_trades(a.csv, a.cost, a.cost_risk_pct)
+    strategies = [s.strip() for s in a.strategies.split(",") if s.strip()] or sorted(df["strategy"].unique())
     df = df[df["strategy"].isin(strategies)]
     if df.empty:
         raise SystemExit("No trades for the selected strategies.")

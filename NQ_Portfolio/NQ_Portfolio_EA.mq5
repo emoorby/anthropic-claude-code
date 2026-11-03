@@ -158,6 +158,8 @@ input double            InpS4_LongTPPts    = 40;
 input double            InpS4_LongSLPts    = 80;
 input double            InpS4_ShortTPPts   = 50;
 input double            InpS4_ShortSLPts   = 80;
+input bool              InpS4_ScaleWithADR = false; // Scale TP/SL by ADR / RefADR
+input double            InpS4_RefADR       = 324;   // Reference ADR (2022-26 median)
 input int               InpS4_MaxTrades    = 4;
 input int               InpS4_MaxLosses    = 2;
 input ENUM_S4_LOSS_RULE InpS4_LossRule     = S4LOSS_TOTAL;
@@ -1434,12 +1436,23 @@ void S4_On5(const MqlRates &b, bool latest)
    if(!longSig && !shortSig)
       return;
 
-   Log(K_S4, StringFormat("SIGNAL %s: trend %d, M15 VWAP %.2f, pullback candle O %.2f C %.2f",
-                          longSig ? "LONG" : "SHORT", g_s4.trend, g_s4.vw.last, b.open, b.close));
+   double f = 1.0;
+   if(InpS4_ScaleWithADR && InpS4_RefADR > 0)
+     {
+      double adr = GetADR(b.time);
+      if(adr <= 0)
+        {
+         Log(K_S4, "SKIP: ADR unavailable");
+         return;
+        }
+      f = adr / InpS4_RefADR;
+     }
+   Log(K_S4, StringFormat("SIGNAL %s: trend %d, M15 VWAP %.2f, pullback candle O %.2f C %.2f, exit scale %.2f",
+                          longSig ? "LONG" : "SHORT", g_s4.trend, g_s4.vw.last, b.open, b.close, f));
    if(longSig)
-      OpenTrade(K_S4, true, false, InpS4_LongSLPts, InpS4_LongTPPts, InpS4_RiskPct, InpS4_FixedLots, InpS4_MaxSpreadPts);
+      OpenTrade(K_S4, true, false, InpS4_LongSLPts * f, InpS4_LongTPPts * f, InpS4_RiskPct, InpS4_FixedLots, InpS4_MaxSpreadPts);
    else
-      OpenTrade(K_S4, false, false, InpS4_ShortSLPts, InpS4_ShortTPPts, InpS4_RiskPct, InpS4_FixedLots, InpS4_MaxSpreadPts);
+      OpenTrade(K_S4, false, false, InpS4_ShortSLPts * f, InpS4_ShortTPPts * f, InpS4_RiskPct, InpS4_FixedLots, InpS4_MaxSpreadPts);
   }
 
 //+------------------------------------------------------------------+

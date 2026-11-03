@@ -53,6 +53,9 @@ Inputs for every research run:
 | S2_swing | S2 | `InpS2_TPMode = S2TP_SWING` |
 | S4_base | S4 | none |
 | S4_consec | S4 | `InpS4_LossRule = S4LOSS_CONSECUTIVE` |
+| S4_long | S4 | `InpS4_AllowShort = false` |
+| S4_long_adr | S4 | `InpS4_AllowShort = false`, `InpS4_ScaleWithADR = true` |
+| S4_long_1loss | S4 | `InpS4_AllowShort = false`, `InpS4_MaxLosses = 1` |
 | ALL | all four | none |
 
 Each run writes to the **common** files folder (`%APPDATA%\MetaQuotes\Terminal\Common\Files`):

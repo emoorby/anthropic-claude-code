@@ -1,4 +1,6 @@
-# NQ Strategy Portfolio EA: Strategy Specification v1 (for sign-off)
+# NQ Strategy Portfolio EA: Strategy Specification v1.2
+
+> **v1.2 (Nov 2026):** final line-up after USTEC backtests (see section 8). **S3 (core) + S1 (support)**; S2 and S4 disabled. S3 stop widened to 0.40 × ADR; S1 stops for the day after its first loss. LIVE profile gains a trailing drawdown-from-high stop.
 
 Source material: MatfinOrg interview "3 strategies" (S1–S3) and the "Golden Ticket" interview (S4).
 Original backtests: MultiCharts, NQ futures, Jan 2022 – Sep 2026, **no commission or slippage**.
@@ -78,6 +80,7 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 | Final risk % | Set by Monte Carlo on our own CFD backtest trades (target: P(breach) below a level you choose) |
 | **Account profiles** | `PROP`: 5% static floor (measured on **equity** [DEFAULT, conservative]) + **7% profit target**: when equity ≥ initial × 1.07, close everything and halt. `LIVE`: floor optional, with its own setting (no 5% rule), and no target |
 | Prop sizing objective | Choose risk % to maximise P(reach +7% before −5%), accepting a longer time to pass. A pure coin flip at this target/floor gives 5 / (7+5) = 41.7%; the edge plus smaller size moves it above that |
+| **LIVE trailing stop (v1.2)** | `InpLiveTrailDDPct` (20%): halt if equity falls 20% from its highest point; the high is saved across restarts; `InpResetHalt` restarts it from current equity |
 | Prop account size | ≥ $25k recommended (ideally $50k) so 0.1-lot steps allow ~0.25% risk per trade with fine control |
 | Benching (phase 2) | Shadow-trade a strategy whose drawdown exceeds its Monte Carlo 75th percentile; resume trading at a new equity high |
 
@@ -95,6 +98,7 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 | Entry | Market at the next bar's open | [CONFIRMED] |
 | Re-entry | No fresh breakout needed. After any exit, the next qualifying bar close re-enters | [CONFIRMED] chart |
 | Limits | 1 position at a time, **max 3 entries per day** | [CONFIRMED] |
+| **Daily loss stop (v1.2)** | **Stop for the day after the first loss** (`InpS1_MaxLosses = 1`) | [TESTED v1.2] |
 | TP / SL | **+40 pts / −75 pts** fixed ($800/$1,500 on NQ). Variant: scale both by ADR15 ÷ its 2022–26 median | [CONFIRMED] / scaling [TEST] |
 | Time exit | 14:30 CT (22:30 server) | [CONFIRMED] |
 
@@ -103,7 +107,7 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 
 ---
 
-## 3. S2 – VWAP Pullback + ADX (M1, long only)
+## 3. S2 – VWAP Pullback + ADX (M1, long only) — DISABLED in v1.2 (no edge on USTEC)
 
 | Element | Rule | Status |
 |---|---|---|
@@ -135,7 +139,7 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 | Bias persistence | Never cancelled by later price action or an opposite break | [CONFIRMED] |
 | Entry | Market at the next bar's open; **1 trade per day** | [CONFIRMED] |
 | Entry cutoff | 14:00 CT (variant: none) | [DEFAULT] / [TEST] |
-| SL / TP | SL = **0.30 × ADR15**; TP = **3 × SL** | [CONFIRMED] |
+| SL / TP | SL = **0.40 × ADR15** (v1.2; source used 0.30); TP = **3 × SL** | [TESTED v1.2] |
 | Time exit | 14:30 CT | [CONFIRMED] |
 
 **Validation targets:** 434 trades (236 L / 198 S) · 53.7% win (L 56.8%, S 50.0%) · avg win 110.5 pts · avg loss 78.9 pts · avg trade **22.8 pts** · break-even 41.7% · worst loss 271 pts · worst losing streak $11,850 per NQ.
@@ -143,7 +147,7 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 
 ---
 
-## 5. S4 – Golden Ticket: Drift VWAP Pullback (M15 trend, M5 trigger, long and short)
+## 5. S4 – Golden Ticket: Drift VWAP Pullback (M15 trend, M5 trigger, long and short) — DISABLED in v1.2 (no edge on USTEC)
 
 | Element | Rule | Status |
 |---|---|---|
@@ -176,3 +180,48 @@ Status key: **[CONFIRMED]** from whiteboard/chart/your checks · **[DEFAULT]** o
 - Live £1,000 account: maximum drawdown you'd tolerate; likely start with S3 only at 0.1 lot.
 - Typical USTEC spread at 08:30–10:00 CT and 14:30–16:00 CT; stops level.
 - How far back ICM real-tick history goes for USTEC.
+
+---
+
+## 8. Backtest results on USTEC (ICM, Jan 2022 – Sep 2026, history quality 10% real ticks)
+
+All profit factors below include an extra **1 index point of cost per trade** (stress for slippage) on top of the tester's spread, unless stated.
+
+### 8.1 Validation against the MultiCharts reports (baseline settings)
+| | Trades (his / ours) | Win % (his / ours) | Avg trade pts (his, no costs / ours) | Verdict |
+|---|---|---|---|---|
+| S1 | 1,151 / 1,072 | 67.7 / 65.9 | 5.6 / 3.7 | ✓ reproduced |
+| S2 | 576 / 582 | 67.7 / 72.0 | 7.2 / 0.2 | entries ✓, exits ✗ (TP geometry not reproducible) |
+| S3 | 434 / 470 | 53.7 / 52.3 | 22.8 / 16.2 | ✓ reproduced (PF 1.40 = his 1.40) |
+| S4 | ~4,000+ / 3,570 | ~64 / 62.5 | ~4.3 / 1.1 | ✓ reproduced, edge lost to spread |
+
+### 8.2 Improvement tests (patterns found in 2022–24, checked on 2025–26)
+| Strategy | Test | PF 22–24 | PF 25–26 | Decision |
+|---|---|---|---|---|
+| S1 | base | 1.07 | 1.22 | – |
+| S1 | **stop after first loss** | 1.10 | 1.26 | **adopted** |
+| S1 | + ADR-scaled exits | 1.14 | 1.23 | no clear gain → not adopted |
+| S2 | PRETOUCH / SWING take profit | ~1.00 / ~1.04 overall | | no edge → disabled |
+| S3 | base (SL 0.30) | 1.46 | 1.25 | – |
+| S3 | exit 14:55 | 1.48 | 1.22 | no gain → keep 14:30 |
+| S3 | session-based ADR | ≈ base | | no gain → keep broker D1 |
+| S3 | SL 0.25 | 1.48 | 1.15 | worse |
+| S3 | **SL 0.40** | 1.47 | 1.57 | **adopted** (best return per unit of risk) |
+| S3 | SL 0.50 | 1.54 | 1.56 | higher PF but lower R per trade → not adopted |
+| S4 | long only / + ADR exits | 1.05 / 1.02 overall | | no edge → disabled |
+
+### 8.3 Final line-up: Monte Carlo (S1 + S3, S3 at 2× S1 risk, +1 pt cost stress)
+**Prop (+7% target, 5% static floor, EA halts at −4.5%):**
+| S1 / S3 risk per trade | Pass | Fail | Median days to pass |
+|---|---|---|---|
+| 0.25% / 0.50% | 73.7% | 3.8% | 134 |
+| 0.35% / 0.70% | 82.6% | 9.9% | 94 |
+
+**Own capital (5-day block bootstrap):**
+| S1 / S3 risk per trade | Backtest CAGR | Median 1-yr return | Bad year (1 in 10) | P(losing year) | P(>20% DD within 5 yrs) |
+|---|---|---|---|---|---|
+| 0.5% / 1.0% | 19.7% | 18.8% | +3.9% | 4.9% | 1.3% |
+| **0.6% / 1.2%** | 23.9% | 22.5% | +4.3% | 5.2% | 4.7% |
+| 0.75% / 1.5% | 30.3% | 29.1% | +5.5% | 5.2% | 16.8% |
+
+Plan on roughly half the backtest return live (data quality, slippage, edge decay).

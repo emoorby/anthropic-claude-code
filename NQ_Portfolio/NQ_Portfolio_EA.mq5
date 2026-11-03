@@ -11,7 +11,7 @@
 //|  converted to broker server time with InpServerMinusCT.          |
 //+------------------------------------------------------------------+
 #property copyright "Built from user-approved spec v1.1"
-#property version   "1.00"
+#property version   "1.10"
 #property description "USTEC intraday portfolio: 4 strategies, prop floor/target guard, CSV trade log"
 
 #include <Trade\Trade.mqh>
@@ -69,15 +69,16 @@ input string       InpFilePrefix      = "NQPortfolio"; // CSV file prefix (Commo
 input string       InpRunTag          = "";     // Optional tag added to CSV file names
 
 input group "=== Account & risk ==="
-input ENUM_PROFILE     InpProfile          = PROFILE_PROP;
+input ENUM_PROFILE     InpProfile          = PROFILE_PROP; // Account profile (PROP / LIVE / RESEARCH)
 input double           InpInitialBalance   = 0;     // Initial balance (0 = balance at first attach)
 input double           InpPropFloorPct     = 5.0;   // PROP static floor (% below initial)
 input double           InpPropTargetPct    = 7.0;   // PROP profit target (%), 0 = off
-input double           InpLiveFloorPct     = 20.0;  // LIVE floor (% below initial), 0 = off
+input double           InpLiveFloorPct     = 0.0;   // LIVE static floor (% below initial), 0 = off
+input double           InpLiveTrailDDPct   = 20.0;  // LIVE: halt if equity falls this % from its high (0 = off)
 input double           InpFloorBufferPct   = 0.5;   // Safety buffer above floor (% of initial)
 input bool             InpResetHalt        = false; // Clear a previous halt on start
-input ENUM_SIZING      InpSizing           = SIZE_RISK_PCT;
-input ENUM_MINLOT_RULE InpMinLotRule       = MINLOT_SKIP;
+input ENUM_SIZING      InpSizing           = SIZE_RISK_PCT; // Position sizing mode
+input ENUM_MINLOT_RULE InpMinLotRule       = MINLOT_SKIP; // If size is below the minimum lot
 input double           InpMinLotRiskCapPct = 1.0;   // Max risk % allowed when forcing min lot
 input double           InpMaxLots          = 50.0;  // Hard cap on lots per trade
 input int              InpDeviationPts     = 50;    // Max deviation (points) for market orders
@@ -85,7 +86,7 @@ input double           InpMinSizingPts     = 10.0;  // Size as if SL were at lea
 input int              InpSessionEndBufMin = 5;     // Close all this many minutes before the broker session ends
 
 input group "=== Shared calculations ==="
-input ENUM_ADR_MODE InpADRMode   = ADR_SMA_OF_ATR;
+input ENUM_ADR_MODE InpADRMode   = ADR_SMA_OF_ATR; // Daily range (ADR) formula
 input int           InpADRDays   = 15;   // Days in average daily range
 input int           InpATRPeriod = 14;   // ATR period (ADR_SMA_OF_ATR mode)
 input bool          InpADRUseSession = false; // Build daily bars from a session (not broker D1)
@@ -93,80 +94,80 @@ input int           InpADRSessionStartCT = 0; // Session start (HHMM CT); sessio
 input int           InpADXPeriod = 14;   // ADX period (Wilder)
 
 input group "=== S1 Vault Break (M30, long) ==="
-input bool   InpS1_Enable        = true;
-input long   InpS1_Magic         = 26001;
-input double InpS1_RiskPct       = 0.25;
-input double InpS1_FixedLots     = 0.1;
-input int    InpS1_AnchorCT      = 0;     // Session open + VWAP anchor (HHMM CT; 2300 = prev evening)
-input double InpS1_NoiseFrac     = 0.30;  // Noise level = open + frac x ADR
-input int    InpS1_WindowStartCT = 1000;  // Signal-bar close from (HHMM CT)  [test 1030]
-input int    InpS1_WindowEndCT   = 1430;  // Signal-bar close before (HHMM CT)
-input int    InpS1_ExitCT        = 1430;  // Time exit (HHMM CT)
-input int    InpS1_MaxEntries    = 3;     // Max entries per day
-input int    InpS1_MaxLosses     = 0;     // Stop for the day after this many losses (0 = off)
-input double InpS1_TPPts         = 40;    // Take profit (index points)
-input double InpS1_SLPts         = 75;    // Stop loss (index points)
-input bool   InpS1_ScaleWithADR  = false; // Scale TP/SL by ADR / RefADR
-input double InpS1_RefADR        = 324;   // Reference ADR for scaling (2022-26 median)
-input double InpS1_MaxSpreadPts  = 4.0;   // Max spread to enter (index points)
+input bool   InpS1_Enable        = true; // S1: Enable strategy
+input long   InpS1_Magic         = 26001; // S1: Magic number (must be unique)
+input double InpS1_RiskPct       = 0.25; // S1: Risk % per trade (risk-% sizing)
+input double InpS1_FixedLots     = 0.1; // S1: Lots per trade (fixed-lots sizing)
+input int    InpS1_AnchorCT      = 0;     // S1: Session open + VWAP anchor (HHMM CT; 2300 = prev evening)
+input double InpS1_NoiseFrac     = 0.30;  // S1: Noise level = open + frac x ADR
+input int    InpS1_WindowStartCT = 1000;  // S1: Signal-bar close from (HHMM CT)  [test 1030]
+input int    InpS1_WindowEndCT   = 1430;  // S1: Signal-bar close before (HHMM CT)
+input int    InpS1_ExitCT        = 1430;  // S1: Time exit (HHMM CT)
+input int    InpS1_MaxEntries    = 3;     // S1: Max entries per day
+input int    InpS1_MaxLosses     = 1;     // S1: Stop for the day after this many losses (0 = off)
+input double InpS1_TPPts         = 40;    // S1: Take profit (index points)
+input double InpS1_SLPts         = 75;    // S1: Stop loss (index points)
+input bool   InpS1_ScaleWithADR  = false; // S1: Scale TP/SL by ADR / RefADR
+input double InpS1_RefADR        = 324;   // S1: Reference ADR for scaling (2022-26 median)
+input double InpS1_MaxSpreadPts  = 4.0;   // S1: Max spread to enter (index points)
 
 input group "=== S2 VWAP Pullback + ADX (M1, long) ==="
-input bool            InpS2_Enable       = true;
-input long            InpS2_Magic        = 26002;
-input double          InpS2_RiskPct      = 0.25;
-input double          InpS2_FixedLots    = 0.1;
-input int             InpS2_ORStartCT    = 830;   // Opening range start (HHMM CT)
-input int             InpS2_OREndCT      = 900;   // Opening range end (HHMM CT)
-input int             InpS2_VWAPAnchorCT = 830;   // VWAP anchor (HHMM CT) [test 0]
-input double          InpS2_ADXMin       = 20;
-input int             InpS2_CutoffCT     = 1430;  // No new entries from (HHMM CT)
-input int             InpS2_ExitCT       = 1455;  // Time exit (HHMM CT) [test 1555]
-input int             InpS2_MaxTrades    = 1;     // Max trades per day [test 2]
-input int             InpS2_TPBars       = 5;     // TP = highest high of N bars
-input int             InpS2_SLBars       = 20;    // SL = lowest low of N bars
-input ENUM_S2_TP_MODE InpS2_TPMode       = S2TP_FIXED;
-input double          InpS2_MinTPPts     = 1.0;   // Skip if TP is closer than this above entry
-input double          InpS2_MaxSpreadPts = 3.0;
+input bool            InpS2_Enable       = false; // S2: Enable strategy
+input long            InpS2_Magic        = 26002; // S2: Magic number (must be unique)
+input double          InpS2_RiskPct      = 0.25; // S2: Risk % per trade (risk-% sizing)
+input double          InpS2_FixedLots    = 0.1; // S2: Lots per trade (fixed-lots sizing)
+input int             InpS2_ORStartCT    = 830;   // S2: Opening range start (HHMM CT)
+input int             InpS2_OREndCT      = 900;   // S2: Opening range end (HHMM CT)
+input int             InpS2_VWAPAnchorCT = 830;   // S2: VWAP anchor (HHMM CT) [test 0]
+input double          InpS2_ADXMin       = 20; // S2: Minimum ADX
+input int             InpS2_CutoffCT     = 1430;  // S2: No new entries from (HHMM CT)
+input int             InpS2_ExitCT       = 1455;  // S2: Time exit (HHMM CT) [test 1555]
+input int             InpS2_MaxTrades    = 1;     // S2: Max trades per day [test 2]
+input int             InpS2_TPBars       = 5;     // S2: TP = highest high of N bars
+input int             InpS2_SLBars       = 20;    // S2: SL = lowest low of N bars
+input ENUM_S2_TP_MODE InpS2_TPMode       = S2TP_FIXED; // S2: Take-profit placement
+input double          InpS2_MinTPPts     = 1.0;   // S2: Skip if TP is closer than this above entry
+input double          InpS2_MaxSpreadPts = 3.0; // S2: Max spread to enter (index points)
 
 input group "=== S3 Overnight Bias ORB (M15, long/short) ==="
-input bool   InpS3_Enable       = true;
-input long   InpS3_Magic        = 26003;
-input double InpS3_RiskPct      = 0.25;
-input double InpS3_FixedLots    = 0.1;
-input int    InpS3_ONStartCT    = 0;     // Overnight range start (HHMM CT) [test 2300]
-input int    InpS3_OpenCT       = 830;   // Cash open / bias bar (HHMM CT)
-input double InpS3_ADXMin       = 20;
-input int    InpS3_CutoffCT     = 1400;  // No new entries from (HHMM CT) [test 1430]
-input int    InpS3_ExitCT       = 1430;  // Time exit (HHMM CT)
-input double InpS3_SLFrac       = 0.30;  // SL = frac x ADR
-input double InpS3_TPMult       = 3.0;   // TP = mult x SL
-input bool   InpS3_AllowLong    = true;
-input bool   InpS3_AllowShort   = true;
-input double InpS3_MaxSpreadPts = 4.0;
+input bool   InpS3_Enable       = true; // S3: Enable strategy
+input long   InpS3_Magic        = 26003; // S3: Magic number (must be unique)
+input double InpS3_RiskPct      = 0.50; // S3: Risk % per trade (risk-% sizing)
+input double InpS3_FixedLots    = 0.1; // S3: Lots per trade (fixed-lots sizing)
+input int    InpS3_ONStartCT    = 0;     // S3: Overnight range start (HHMM CT) [test 2300]
+input int    InpS3_OpenCT       = 830;   // S3: Cash open / bias bar (HHMM CT)
+input double InpS3_ADXMin       = 20; // S3: Minimum ADX
+input int    InpS3_CutoffCT     = 1400;  // S3: No new entries from (HHMM CT) [test 1430]
+input int    InpS3_ExitCT       = 1430;  // S3: Time exit (HHMM CT)
+input double InpS3_SLFrac       = 0.40;  // S3: SL = frac x ADR
+input double InpS3_TPMult       = 3.0;   // S3: TP = mult x SL
+input bool   InpS3_AllowLong    = true; // S3: Allow long trades
+input bool   InpS3_AllowShort   = true; // S3: Allow short trades
+input double InpS3_MaxSpreadPts = 4.0; // S3: Max spread to enter (index points)
 
 input group "=== S4 Drift VWAP Pullback / Golden Ticket (M15 + M5) ==="
-input bool              InpS4_Enable       = true;
-input long              InpS4_Magic        = 26004;
-input double            InpS4_RiskPct      = 0.25;
-input double            InpS4_FixedLots    = 0.1;
-input int               InpS4_VWAPAnchorCT = 830;   // VWAP anchor on M15 (HHMM CT)
-input int               InpS4_TradeStartCT = 930;   // First signal-bar close (HHMM CT)
-input int               InpS4_CutoffCT     = 1430;  // No new entries from (HHMM CT)
-input int               InpS4_ExitCT       = 1455;  // Close all (HHMM CT)
-input double            InpS4_MinMovePct   = 0.10;  // Min 1-hour move (%)
-input int               InpS4_LookbackBars = 4;     // M15 bars for the move (4 = 1 hour)
-input double            InpS4_LongTPPts    = 40;
-input double            InpS4_LongSLPts    = 80;
-input double            InpS4_ShortTPPts   = 50;
-input double            InpS4_ShortSLPts   = 80;
-input bool              InpS4_ScaleWithADR = false; // Scale TP/SL by ADR / RefADR
-input double            InpS4_RefADR       = 324;   // Reference ADR (2022-26 median)
-input int               InpS4_MaxTrades    = 4;
-input int               InpS4_MaxLosses    = 2;
-input ENUM_S4_LOSS_RULE InpS4_LossRule     = S4LOSS_TOTAL;
-input bool              InpS4_AllowLong    = true;
-input bool              InpS4_AllowShort   = true;
-input double            InpS4_MaxSpreadPts = 3.0;
+input bool              InpS4_Enable       = false; // S4: Enable strategy
+input long              InpS4_Magic        = 26004; // S4: Magic number (must be unique)
+input double            InpS4_RiskPct      = 0.25; // S4: Risk % per trade (risk-% sizing)
+input double            InpS4_FixedLots    = 0.1; // S4: Lots per trade (fixed-lots sizing)
+input int               InpS4_VWAPAnchorCT = 830;   // S4: VWAP anchor on M15 (HHMM CT)
+input int               InpS4_TradeStartCT = 930;   // S4: First signal-bar close (HHMM CT)
+input int               InpS4_CutoffCT     = 1430;  // S4: No new entries from (HHMM CT)
+input int               InpS4_ExitCT       = 1455;  // S4: Close all (HHMM CT)
+input double            InpS4_MinMovePct   = 0.10;  // S4: Min 1-hour move (%)
+input int               InpS4_LookbackBars = 4;     // S4: M15 bars for the move (4 = 1 hour)
+input double            InpS4_LongTPPts    = 40; // S4: Long take profit (index points)
+input double            InpS4_LongSLPts    = 80; // S4: Long stop loss (index points)
+input double            InpS4_ShortTPPts   = 50; // S4: Short take profit (index points)
+input double            InpS4_ShortSLPts   = 80; // S4: Short stop loss (index points)
+input bool              InpS4_ScaleWithADR = false; // S4: Scale TP/SL by ADR / RefADR
+input double            InpS4_RefADR       = 324;   // S4: Reference ADR (2022-26 median)
+input int               InpS4_MaxTrades    = 4; // S4: Max trades per day
+input int               InpS4_MaxLosses    = 2; // S4: Stop for the day after this many losses
+input ENUM_S4_LOSS_RULE InpS4_LossRule     = S4LOSS_TOTAL; // S4: Loss limit counts total or consecutive losses
+input bool              InpS4_AllowLong    = true; // S4: Allow long trades
+input bool              InpS4_AllowShort   = true; // S4: Allow short trades
+input double            InpS4_MaxSpreadPts = 3.0; // S4: Max spread to enter (index points)
 
 //+------------------------------------------------------------------+
 //| Structures                                                       |
@@ -252,6 +253,7 @@ int      g_hADX_M1  = INVALID_HANDLE;
 int      g_hADX_M15 = INVALID_HANDLE;
 
 double   g_initBal = 0;
+double   g_hwm     = 0;      // LIVE: highest equity seen (trailing drawdown)
 bool     g_halted  = false;
 string   g_gv      = "";
 
@@ -771,9 +773,24 @@ double FloorLevel()
    if(InpProfile == PROFILE_RESEARCH)
       return -1;
    double pct = (InpProfile == PROFILE_PROP) ? InpPropFloorPct : InpLiveFloorPct;
-   if(pct <= 0)
-      return -1;
-   return g_initBal * (1.0 - pct / 100.0);
+   double fl = (pct > 0) ? g_initBal * (1.0 - pct / 100.0) : -1;
+   // LIVE: trailing floor below the equity high-water mark
+   if(InpProfile == PROFILE_LIVE && InpLiveTrailDDPct > 0 && g_hwm > 0)
+      fl = MathMax(fl, g_hwm * (1.0 - InpLiveTrailDDPct / 100.0));
+   return fl;
+  }
+
+// LIVE: track the equity high-water mark (persisted across restarts)
+void UpdateHWM()
+  {
+   if(InpProfile != PROFILE_LIVE || InpLiveTrailDDPct <= 0)
+      return;
+   double eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(eq > g_hwm)
+     {
+      g_hwm = eq;
+      GlobalVariableSet(g_gv + "hwm", g_hwm);
+     }
   }
 
 double BufferAmount() { return g_initBal * InpFloorBufferPct / 100.0; }
@@ -801,6 +818,7 @@ void CheckGuards()
       CloseAllOurs("halted");
       return;
      }
+   UpdateHWM();
    double eq = AccountInfoDouble(ACCOUNT_EQUITY);
    double fl = FloorLevel();
    if(fl > 0 && eq <= fl + BufferAmount())
@@ -1688,14 +1706,24 @@ int OnInit()
          GlobalVariableSet(g_gv + "initbal", g_initBal);
         }
    if(InpResetHalt)
+     {
       GlobalVariableDel(g_gv + "halt");
+      GlobalVariableDel(g_gv + "hwm");   // restart the trailing drawdown from current equity
+     }
+   if(InpProfile == PROFILE_LIVE && InpLiveTrailDDPct > 0)
+     {
+      if(GlobalVariableCheck(g_gv + "hwm"))
+         g_hwm = GlobalVariableGet(g_gv + "hwm");
+      g_hwm = MathMax(g_hwm, AccountInfoDouble(ACCOUNT_EQUITY));
+      GlobalVariableSet(g_gv + "hwm", g_hwm);
+     }
    g_halted = (InpProfile != PROFILE_RESEARCH && GlobalVariableCheck(g_gv + "halt"));
 
    if(AccountInfoInteger(ACCOUNT_MARGIN_MODE) != ACCOUNT_MARGIN_MODE_RETAIL_HEDGING)
       Print("WARNING: account is not a hedging account; strategies may net against each other.");
 
-   PrintFormat("NQ Portfolio EA on %s | profile %s | initial balance %.2f | floor %.2f | target %.2f | halted=%s",
-               _Symbol, EnumToString(InpProfile), g_initBal, FloorLevel(), TargetLevel(), g_halted ? "YES" : "no");
+   PrintFormat("NQ Portfolio EA on %s | profile %s | initial balance %.2f | floor %.2f | target %.2f | equity high %.2f | halted=%s",
+               _Symbol, EnumToString(InpProfile), g_initBal, FloorLevel(), TargetLevel(), g_hwm, g_halted ? "YES" : "no");
    PrintFormat("Time map (server = CT + %d h): 00:00 CT=%02d:%02d, 08:30 CT=%02d:%02d, 14:30 CT=%02d:%02d",
                InpServerMinusCT, SrvMin(0) / 60, SrvMin(0) % 60, SrvMin(830) / 60, SrvMin(830) % 60,
                SrvMin(1430) / 60, SrvMin(1430) % 60);

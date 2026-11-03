@@ -78,17 +78,21 @@ python monte_carlo.py NQPortfolio_ALL_trades.csv --weights S3=1.5,S4=0.5
 ```
 It reports P(pass) and P(fail) for each risk level against the +7% target and the −5% static floor, plus the 75th-percentile drawdown yardstick used for benching.
 
-## Step 4: Prop / live settings (after testing)
+## Step 4: Final line-up and live settings (v1.2)
+The defaults are now the final line-up: **S3 (core) + S1 (support)**. S2 and S4 are off. S3 uses a 0.40 × ADR stop, and S1 stops for the day after its first loss.
+
 **PROP**
-- `InpProfile = PROFILE_PROP`, `InpSizing = SIZE_RISK_PCT`
-- Risk % per strategy taken from the Monte Carlo
-- The EA halts at +7% (target) or at −4.5% (floor plus buffer). It also refuses any trade that, if every open stop were hit, would breach the floor.
+- `Account profile` = PROFILE_PROP, `Position sizing mode` = SIZE_RISK_PCT
+- Defaults: S1 0.25% and S3 0.50% per trade. Use 0.35% / 0.70% for faster passes with a higher chance of failing (see spec section 8.3)
+- The EA halts at +7% (target) or at −4.5% (floor plus buffer). It refuses any trade that, if every open stop were hit, would breach the floor.
 
-**LIVE (£1,000)**
-- `InpProfile = PROFILE_LIVE`, S3 only, `InpSizing = SIZE_FIXED_LOTS`, `InpS3_FixedLots = 0.1`
-- Floor at 20% (`InpLiveFloorPct`)
+**LIVE (own capital)**
+- `Account profile` = PROFILE_LIVE
+- **"LIVE: halt if equity falls this % from its high"** = 20. The EA tracks your equity high (saved across restarts) and closes everything and halts if equity drops 20% below it. The pre-trade check stops any trade that could breach it.
+- Suggested risk: S1 0.6% / S3 1.2% (spec section 8.3). On £1,000 the minimum lot decides for you: use `Position sizing mode` = SIZE_FIXED_LOTS with 0.1 lots on each (≈0.6% / ≈1.0% risk).
+- To restart after a halt: set `Clear a previous halt on start` = true once. This also restarts the trailing high from current equity.
 
-**Restarts:** the halt flag and initial balance are kept in MT5 global variables (F3). For a new challenge on the same login, set `InpResetHalt = true` and set `InpInitialBalance` to the new starting balance.
+**Restarts:** the halt flag, initial balance and equity high are kept in MT5 global variables (F3). For a new prop challenge on the same login, set `Clear a previous halt on start` = true and set `Initial balance` to the new starting balance.
 
 ## Safety inputs (added in review)
 - `InpMinSizingPts = 10`: in risk-% mode, the lot size is calculated as if the stop were at least 10 points away. This stops S2's sometimes very tight 20-bar-low stop from producing an oversized position. It does not move the stop itself.

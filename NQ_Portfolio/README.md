@@ -39,6 +39,9 @@ Inputs for every research run:
 | S1_1030 | S1 | `InpS1_WindowStartCT = 1030` |
 | S1_TR | S1 | `InpADRMode = ADR_SMA_OF_TR` |
 | S1_2300 | S1 | `InpS1_AnchorCT = 2300` |
+| S1_1loss | S1 | `InpS1_MaxLosses = 1` |
+| S1_adr | S1 | `InpS1_ScaleWithADR = true` (RefADR 324) |
+| S1_1loss_adr | S1 | both of the above |
 | S1_sess | S1 | `InpADRUseSession = true` (daily range from 00:00–16:00 CT only) |
 | S2_base | S2 | none |
 | S2_vw0 | S2 | `InpS2_VWAPAnchorCT = 0` |

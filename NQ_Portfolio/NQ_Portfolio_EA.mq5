@@ -103,10 +103,11 @@ input int    InpS1_WindowStartCT = 1000;  // Signal-bar close from (HHMM CT)  [t
 input int    InpS1_WindowEndCT   = 1430;  // Signal-bar close before (HHMM CT)
 input int    InpS1_ExitCT        = 1430;  // Time exit (HHMM CT)
 input int    InpS1_MaxEntries    = 3;     // Max entries per day
+input int    InpS1_MaxLosses     = 0;     // Stop for the day after this many losses (0 = off)
 input double InpS1_TPPts         = 40;    // Take profit (index points)
 input double InpS1_SLPts         = 75;    // Stop loss (index points)
 input bool   InpS1_ScaleWithADR  = false; // Scale TP/SL by ADR / RefADR
-input double InpS1_RefADR        = 350;   // Reference ADR for scaling
+input double InpS1_RefADR        = 324;   // Reference ADR for scaling (2022-26 median)
 input double InpS1_MaxSpreadPts  = 4.0;   // Max spread to enter (index points)
 
 input group "=== S2 VWAP Pullback + ADX (M1, long) ==="
@@ -1089,6 +1090,8 @@ void S1_OnBar(const MqlRates &b, bool latest)
    if(PosTicket(g_st[K_S1].magic) != 0)
       return;
    if(g_st[K_S1].trades >= InpS1_MaxEntries)
+      return;
+   if(InpS1_MaxLosses > 0 && g_st[K_S1].losses >= InpS1_MaxLosses)
       return;
    double adr = GetADR(b.time);
    if(adr <= 0)

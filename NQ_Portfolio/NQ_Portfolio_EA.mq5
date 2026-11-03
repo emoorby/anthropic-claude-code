@@ -28,7 +28,8 @@ enum ENUM_MARKET
    MKT_DE40          = 3, // DE40 preset (Frankfurt time)
    MKT_XAUUSD_NY     = 4, // XAUUSD preset, New York anchor (US Central)
    MKT_XAUUSD_LDN    = 5, // XAUUSD preset, London anchor (London time)
-   MKT_JP225         = 6  // JP225 preset (Tokyo time) - experimental
+   MKT_JP225         = 6, // JP225 preset (Tokyo time), overnight 07:00-09:00 - experimental
+   MKT_JP225_FULL    = 7  // JP225 preset, overnight from previous Tokyo close 15:30 - experimental
   };
 
 enum ENUM_TZ
@@ -1451,6 +1452,32 @@ void S3_OnBar(const MqlRates &b, bool latest)
      {
       if(om < op)
          return;
+      // overnight range that starts on the previous trading day (e.g. the
+      // previous Tokyo close): collect it in one go at the open
+      if(onS >= op)
+        {
+         datetime startT = d + onS * 60 - 86400;
+         while(DOW(startT) == 0 || DOW(startT) == 6)
+            startT -= 86400;            // Monday: go back to Friday
+         MqlRates r[];
+         ArraySetAsSeries(r, false);
+         int n = CopyRates(_Symbol, PERIOD_M15, startT, b.time - 1, r);
+         g_s3.onInit = false;
+         for(int i = 0; i < n; i++)
+           {
+            if(!g_s3.onInit)
+              {
+               g_s3.onH = r[i].high;
+               g_s3.onL = r[i].low;
+               g_s3.onInit = true;
+              }
+            else
+              {
+               g_s3.onH = MathMax(g_s3.onH, r[i].high);
+               g_s3.onL = MathMin(g_s3.onL, r[i].low);
+              }
+           }
+        }
       // first bar at/after the cash open: bias + opening range
       g_s3.orDone = true;
       g_s3.orH = b.high;
@@ -1805,6 +1832,13 @@ void ApplyPreset()
          SetS1(700, 1030, 1500, 1500);
          SetS3(700, 900, 1430, 1500);
          autoOff = 600;
+         break;
+      case MKT_JP225_FULL:
+         g_mktName = "JP225 (full overnight)";
+         g_tz = TZ_TOKYO;
+         SetS1(700, 1030, 1500, 1500);
+         SetS3(1530, 900, 1430, 1500);   // 15:30 = previous day's Tokyo close
+         autoOff = 700;
          break;
       default:
          g_mktName = "USTEC/custom";

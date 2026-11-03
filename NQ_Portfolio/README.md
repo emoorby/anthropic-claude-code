@@ -105,6 +105,7 @@ Attach **one copy of the EA per market**, each on its own chart, and choose **"M
 | XAUUSD (New York) | US Central | 00:00 → 07:30 | 12:00 / 12:30 | 09:00–12:30 | 400 |
 | XAUUSD (London) | London | 00:00 → 08:00 | 16:00 / 16:30 | 09:30–16:30 | 500 |
 | JP225 (experimental) | Tokyo | 07:00 → 09:00 | 14:30 / 15:00 | 10:30–15:00 | 600 |
+| JP225 (full overnight) | Tokyo | previous day 15:30 → 09:00 | 14:30 / 15:00 | 10:30–15:00 | 700 |
 
 - **One floor for the whole account:** the floor, target and pre-trade risk checks count open positions on **all symbols**, and a halt on one chart halts every chart on the same login.
 - **Holidays:** only the US calendar is built in, so it applies to US-time presets only.

@@ -1,4 +1,6 @@
-# NQ Strategy Portfolio EA: Strategy Specification v1.2
+# NQ Strategy Portfolio EA: Strategy Specification v1.3
+
+> **v1.3 (Nov 2026):** EA v1.20 adds market presets (US500, US30, DE40, XAUUSD New York/London, JP225), account-wide risk checks and a shared halt across charts. Multi-market test results are in section 9. **Final line-up unchanged: USTEC S3 + S1. US500 S3 is validated as a backup or an optional 25% split of S3 risk.**
 
 > **v1.2 (Nov 2026):** final line-up after USTEC backtests (see section 8). **S3 (core) + S1 (support)**; S2 and S4 disabled. S3 stop widened to 0.40 × ADR; S1 stops for the day after its first loss. LIVE profile gains a trailing drawdown-from-high stop.
 
@@ -225,3 +227,45 @@ All profit factors below include an extra **1 index point of cost per trade** (s
 | 0.75% / 1.5% | 30.3% | 29.1% | +5.5% | 5.2% | 16.8% |
 
 Plan on roughly half the backtest return live (data quality, slippage, edge decay).
+
+---
+
+## 9. Multi-market results (EA v1.20, Jan 2022 – Sep 2026)
+
+Rules unchanged from USTEC; only session times (local exchange time, local DST) and range-scaled point values differ. Profit factors are in R with a cost stress of **1% of each trade's stop distance**.
+
+| Market (preset) | S1 PF | S3 PF | S3 PF 22–24 / 25–26 | Daily-R correlation with USTEC S3 | Verdict |
+|---|---|---|---|---|---|
+| **USTEC** | 1.16 | **1.50** | 1.47 / 1.57 | – | **core** |
+| **US500** | 1.10 | **1.28** | 1.32 / 1.18 (every year ≥ 1.04) | 0.69 | **backup / optional 25% split** |
+| XAUUSD New York | 0.99 | 1.11 | 1.18 / 0.99 | −0.05 | watch-list (demo only) |
+| JP225 (07:00–09:00 range) | 0.97 | 1.14 | 1.23 / 1.06; in drawdown since Jun 2026 | 0.00 | drop |
+| JP225 (full overnight) | – | 0.96 | | | drop |
+| DE40 | 0.93 | 0.91* | 0.99 / 0.87* | | drop |
+| XAUUSD London | 0.83* | 0.95* | 0.99 / 0.84* | | drop |
+
+\* These runs used a leftover S3 stop of 0.50 (see 9.3). They were clear fails at that setting, so they weren't re-run.
+
+### 9.1 Portfolio effect (Monte Carlo, S1 + S3 on USTEC with S3 at 2× S1 risk, base risk 0.25% / 0.35%)
+| Portfolio | Pass / fail at 0.25% | Pass / fail at 0.35% |
+|---|---|---|
+| USTEC S1 + S3 | 73.9% / 3.8% | 82.7% / 9.8% |
+| + US500 S3 on top | 80.2% / 8.3% | 82.3% / 15.5% |
+| USTEC S3 split 75/25 with US500 S3 | 71.5% / 3.7% | 82.6% / 8.8% |
+| + XAUUSD S3 (1×) | 78.4% / 4.0% | 85.6% / 9.6% |
+
+**What the multi-market tests show:**
+- **The overnight-bias effect holds on US indices** (USTEC and US500), which supports it being real.
+- **It does not carry over reliably to DAX, gold or Nikkei.** Gold and JP225 only look useful in the portfolio because they're uncorrelated; their own edges are too thin and uneven to trust.
+- **For real diversification, the next step is a different strategy type built for those markets**, not the same rules.
+
+### 9.2 Final line-up
+| Chart | Strategies | Prop risk per trade | Own-capital risk per trade |
+|---|---|---|---|
+| USTEC (preset USTEC/custom) | S3 + S1 | S3 0.50%, S1 0.25% (faster: 0.70% / 0.35%) | S3 1.2%, S1 0.6% (on £1,000: 0.1 lot each) |
+| US500 (optional, preset US500) | S3 only | take 25% of the total S3 risk from USTEC | same split |
+
+### 9.3 Testing lessons
+- **The MT5 Strategy Tester keeps the last-used inputs** for an EA, even after a recompile with new defaults. Reset the inputs before each new test series and check the key values. The EA's CSV makes it possible to infer the S3 stop actually used: on days when both strategies traded, take the ratio of S3's stop to S1's stop.
+- **The tester's Symbol box decides the market traded**, not the chart that's open. Always check the `symbol` column in the trade log.
+- **Gold is 100 oz per lot, and JP225 is about $0.0065 per point per lot.** Always use risk-% sizing. On JP225, raise "Hard cap on lots per trade" above 50 if you ever trade it.

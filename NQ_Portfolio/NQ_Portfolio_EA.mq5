@@ -12,7 +12,7 @@
 //|  to broker server time with the DST rules of the market's zone.  |
 //+------------------------------------------------------------------+
 #property copyright "Built from user-approved spec v1.1"
-#property version   "1.20"
+#property version   "1.21"
 #property description "Multi-market intraday portfolio: market presets, account-wide prop floor/target guard, CSV trade log"
 
 #include <Trade\Trade.mqh>

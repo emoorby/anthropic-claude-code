@@ -1,6 +1,8 @@
 # NQ Strategy Portfolio EA: Strategy Specification v1.3
 
-> **v1.3 (Nov 2026):** EA v1.20 adds market presets (US500, US30, DE40, XAUUSD New York/London, JP225), account-wide risk checks and a shared halt across charts. Multi-market test results are in section 9. **Final line-up unchanged: USTEC S3 + S1. US500 S3 is validated as a backup or an optional 25% split of S3 risk.**
+> **Document vs EA versions:** this spec is v1.3; the matching EA is **v1.21** (shown when you attach it to a chart). They are numbered separately.
+>
+> **v1.3 (Nov 2026):** EA v1.20–v1.21 adds market presets (US500, US30, DE40, XAUUSD New York/London, JP225), account-wide risk checks and a shared halt across charts. Multi-market test results are in section 9. **Final line-up unchanged: USTEC S3 + S1. US500 S3 is validated as a backup or an optional 25% split of S3 risk.**
 
 > **v1.2 (Nov 2026):** final line-up after USTEC backtests (see section 8). **S3 (core) + S1 (support)**; S2 and S4 disabled. S3 stop widened to 0.40 × ADR; S1 stops for the day after its first loss. LIVE profile gains a trailing drawdown-from-high stop.
 
